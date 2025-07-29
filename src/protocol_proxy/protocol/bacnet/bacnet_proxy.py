@@ -153,6 +153,7 @@ class BACnet:
             router_info_cache=router_info_cache,
             aseID=ase_id
         )
+        _log.debug(f'WE HAVE AN APP: {self.app.device_info_cache}')
 
     async def query_device(self, address: str, property_name: str = 'object-identifier'):
         """Returns properties about the device at the given address.
@@ -160,6 +161,7 @@ class BACnet:
             This function allows unicast discovery.
             This can get everything from device if it is using read_property_multiple and ALL
         """
+        _log.debug('IN QUERY DEVICE METHOD')
         return await self.read_property(device_address=address, object_identifier='device:4194303',
                                         property_identifier=property_name)
 

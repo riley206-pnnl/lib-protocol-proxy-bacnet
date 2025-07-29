@@ -31,14 +31,14 @@ ignore_missing_imports = true
 ignore_missing_imports = true
 
 [tool.poetry]
-name = "volttron-lib-bacnet-proxy"
+name = "protocol-proxy-bacnet"
 version = "2.0.0rc0"
 description = "Volttron BACnet Protocol Proxy implementation for the VOLTTRON platform. A BACnet Manager is provided which can launch proxy devices for communication with a BACnet network."
 authors = ["The VOLTTRON Development Team <volttron@pnnl.gov>"]
 license = "Apache License 2.0"
 readme = "README.md"
-repository = "https://github.com/eclipse-volttron/volttron-lib-bacnet-proxy"
-homepage = "https://github.com/eclipse-volttron/volttron-lib-bacnet-proxy"
+repository = "https://github.com/eclipse-volttron/lib-protocol-proxy-bacnet"
+homepage = "https://github.com/eclipse-volttron/lib-protocol-proxy-bacnet"
 keywords = []
 packages = [ { include = "protocol_proxy", from = "src" } ]
 classifiers = [
