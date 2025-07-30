@@ -1,16 +1,20 @@
 import asyncio
+import ipaddress
 import json
 import logging
 import sys
+import time
+import traceback
 
 from argparse import ArgumentParser
 from datetime import datetime
 from math import floor
-from typing import Type
+from typing import Optional, Type
 
 from bacpypes3.app import Application
-from bacpypes3.basetypes import DateTime
+from bacpypes3.basetypes import DateTime, PropertyReference
 from bacpypes3.constructeddata import AnyAtomic
+from bacpypes3.lib.batchread import BatchRead, DeviceAddressObjectPropertyReference
 from bacpypes3.pdu import Address, PDUData
 from bacpypes3.apdu import (ConfirmedPrivateTransferACK, ConfirmedPrivateTransferError, ConfirmedPrivateTransferRequest,
                             ErrorRejectAbortNack, TimeSynchronizationRequest)
@@ -21,7 +25,7 @@ from protocol_proxy.ipc import callback
 from protocol_proxy.proxy import launch
 from protocol_proxy.proxy.asyncio import AsyncioProtocolProxy
 
-logging.basicConfig(filename='/home/dmr/Scratch/driver_testing/.volttron/bacnet_proxy.log', level=logging.DEBUG,
+logging.basicConfig(filename='/home/riley/VOLTTRON/volttron_bacnet_stuff/combined_changes/bacnet_proxy.log', level=logging.DEBUG,
                     format='%(asctime)s - %(message)s')
 _log = logging.getLogger(__name__)
 
@@ -33,6 +37,11 @@ class BACnetProxy(AsyncioProtocolProxy):
         super(BACnetProxy, self).__init__(**kwargs)
         self.bacnet = BACnet(local_device_address, bacnet_network, vendor_id, object_name, **kwargs)
         self.loop = asyncio.get_event_loop()
+        
+        # Cache for object-list to avoid re-reading on every page request
+        # Format: {device_key: (object_list, timestamp)}
+        self._object_list_cache = {}
+        self._cache_timeout = 300
 
         self.register_callback(self.confirmed_private_transfer_endpoint, 'CONFIRMED_PRIVATE_TRANSFER', provides_response=True)
         self.register_callback(self.query_device_endpoint, 'QUERY_DEVICE', provides_response=True)
@@ -41,6 +50,13 @@ class BACnetProxy(AsyncioProtocolProxy):
         self.register_callback(self.time_synchronization_endpoint, 'TIME_SYNCHRONIZATION', provides_response=True)
         self.register_callback(self.send_object_user_lock_time_endpoint, 'SEND_OBJECT_USER_LOCK_TIME', provides_response=True)
         self.register_callback(self.write_property_endpoint, 'WRITE_PROPERTY', provides_response=True)
+        self.register_callback(self.read_device_all_endpoint, 'READ_DEVICE_ALL', provides_response=True)
+        self.register_callback(self.who_is_endpoint, 'WHO_IS', provides_response=True)
+        self.register_callback(self.scan_subnet_endpoint, 'SCAN_SUBNET', provides_response=True, timeout=300)
+        self.register_callback(self.read_object_list_names_endpoint, 'READ_OBJECT_LIST_NAMES', provides_response=True, timeout=300)
+        self.register_callback(self.read_object_list_names_endpoint, 'READ_OBJECT_LIST', provides_response=True, timeout=300)
+        self.register_callback(self.clear_cache_endpoint, 'CLEAR_CACHE', provides_response=True)
+        self.register_callback(self.get_cache_stats_endpoint, 'GET_CACHE_STATS', provides_response=True)
 
     @callback
     async def confirmed_private_transfer_endpoint(self, _, raw_message: bytes):
@@ -126,6 +142,197 @@ class BACnetProxy(AsyncioProtocolProxy):
         result = await self.bacnet.read_property(address, write_specifications)
         return json.dumps(result).encode('utf8')
 
+    @callback
+    async def read_device_all_endpoint(self, _, raw_message: bytes):
+        """Endpoint for reading all properties from a BACnet device."""
+        try:
+            message = json.loads(raw_message.decode('utf8'))
+            device_address = message['device_address']
+            device_object_identifier = message['device_object_identifier']
+            result = await self.read_device_all(device_address, device_object_identifier)
+            if not result:
+                return json.dumps({"error": "No data returned from read_device_all"}).encode('utf8')
+            def make_jsonable(val):
+                if isinstance(val, (str, int, float, bool)):
+                    return val
+                if isinstance(val, (list, tuple, set)):
+                    return [make_jsonable(v) for v in val]
+                if isinstance(val, (bytes, bytearray)):
+                    return val.hex()
+                if hasattr(val, '__dict__') and not isinstance(val, type):
+                    return {str(k): make_jsonable(v) for k, v in val.__dict__.items()}
+                # TODO: Replace this forced string conversion with proper BACnet object serialization
+                return f"FORCED:{str(val)}"
+            jsonable_result = {str(k): make_jsonable(v) for k, v in result.items()}
+            return json.dumps(jsonable_result).encode('utf8')
+        except Exception as e:
+            tb = traceback.format_exc()
+            return json.dumps({"error": str(e), "traceback": tb}).encode('utf8')
+
+    @callback
+    async def who_is_endpoint(self, _, raw_message: bytes):
+        """Endpoint for WHO-IS discovery."""
+        message = json.loads(raw_message.decode('utf8'))
+        device_instance_low = message.get('device_instance_low', 0)
+        device_instance_high = message.get('device_instance_high', 4194303)
+        dest = message.get('dest', '255.255.255.255:47808')
+        apdu_timeout = message.get('apdu_timeout', None)  # Keep for backward compatibility but don't use
+        result = await self.who_is(device_instance_low, device_instance_high, dest)
+        return json.dumps(result).encode('utf8')
+
+    @callback
+    async def scan_subnet_endpoint(self, _, raw_message: bytes):
+        """Endpoint for subnet scanning."""
+        message = json.loads(raw_message.decode('utf8'))
+        network_str = message['network']
+        whois_timeout = message.get('whois_timeout', 3.0)
+        result = await self.scan_subnet(network_str, whois_timeout)
+        return json.dumps(result).encode('utf8')
+
+    @callback
+    async def read_object_list_names_endpoint(self, _, raw_message: bytes):
+        """Endpoint for reading object-list and object-names from a BACnet device with pagination."""
+        try:
+            message = json.loads(raw_message.decode('utf8'))
+            device_address = message['device_address']
+            device_object_identifier = message['device_object_identifier']
+            page = message.get('page', 1)
+            page_size = message.get('page_size', 100)
+            
+            logging.getLogger(__name__).info(f"read_object_list_names_endpoint called for device {device_address}, page {page}, page_size {page_size}")
+            
+            # Check if the BACnet application is still connected
+            if not hasattr(self.bacnet, 'app') or self.bacnet.app is None:
+                return json.dumps({"status": "error", "error": "BACnet application not available"}).encode('utf8')
+            
+            result = await self.read_object_list_names_paginated(device_address, device_object_identifier, page, page_size)
+            
+            logging.getLogger(__name__).info(f"read_object_list_names_paginated returned response with status: {result.get('status')}")
+            
+            # Check for error in the result
+            if result.get('status') == 'error':
+                logging.getLogger(__name__).error(f"Error in read_object_list_names_paginated: {result['error']}")
+                return json.dumps(result).encode('utf8')
+            
+            def make_jsonable(val):
+                if isinstance(val, (str, int, float, bool)):
+                    # Special handling for integer units - convert to EngineeringUnits name
+                    if isinstance(val, int):
+                        # Check if this looks like a BACnet EngineeringUnits value
+                        try:
+                            from bacpypes3.basetypes import EngineeringUnits
+                            # Try to convert the integer to an EngineeringUnits enum
+                            engineering_unit = EngineeringUnits(val)
+                            unit_str = str(engineering_unit)
+                            # Handle BACnet EngineeringUnits string format
+                            if unit_str.startswith('EngineeringUnits(') and unit_str.endswith(')'):
+                                return unit_str[17:-1]  # Remove "EngineeringUnits(" and ")"
+                            else:
+                                return unit_str
+                        except (ImportError, ValueError, TypeError):
+                            # If conversion fails, return the original value
+                            pass
+                    return val
+                if val is None:
+                    return None
+                if isinstance(val, (list, tuple, set)):
+                    return [make_jsonable(v) for v in val]
+                if isinstance(val, dict):
+                    return {str(k): make_jsonable(v) for k, v in val.items()}
+                if isinstance(val, (bytes, bytearray)):
+                    return val.hex()
+                # Handle BACnet EngineeringUnits and other enum-like objects
+                if hasattr(val, '__class__') and 'EngineeringUnits' in str(val.__class__):
+                    # This is a BACnet EngineeringUnits object
+                    unit_str = str(val)
+                    if unit_str.startswith('EngineeringUnits(') and unit_str.endswith(')'):
+                        return unit_str[17:-1]  # Remove "EngineeringUnits(" and ")"
+                    else:
+                        return unit_str
+                if hasattr(val, 'name') and hasattr(val, 'value'):
+                    # This is likely a standard Python enum
+                    return str(val.name)
+                if hasattr(val, 'name') and not hasattr(val, 'value'):
+                    # Handle other enum-like objects that only have name
+                    return str(val.name)
+                if hasattr(val, '__str__'):
+                    val_str = str(val)
+                    # Skip conversion to FORCED if it looks like an error object
+                    if 'ErrorType' in val_str or 'Error' in type(val).__name__:
+                        return None
+                    # Check if it's a BACnet EngineeringUnits string representation
+                    if 'EngineeringUnits:' in val_str or 'EngineeringUnits(' in val_str:
+                        # Extract the unit name from various formats
+                        import re
+                        match = re.search(r'EngineeringUnits(?:\(|:)\s*([^>)]+)', val_str)
+                        if match:
+                            return match.group(1).strip()
+                    return val_str
+                return str(val)
+            
+            # Make the results jsonable
+            if 'results' in result:
+                jsonable_results = {}
+                for obj_id, properties in result['results'].items():
+                    if isinstance(properties, dict):
+                        # Special handling for units property
+                        processed_properties = {}
+                        for prop_name, prop_value in properties.items():
+                            if prop_name == 'units' and isinstance(prop_value, int):
+                                # Convert numeric units to EngineeringUnits name
+                                try:
+                                    from bacpypes3.basetypes import EngineeringUnits
+                                    engineering_unit = EngineeringUnits(prop_value)
+                                    # Get the string representation and extract the unit name
+                                    unit_str = str(engineering_unit)
+                                    # BACnet EngineeringUnits string format is like "EngineeringUnits(amperes)"
+                                    # or just the name directly, so we need to handle both cases
+                                    if unit_str.startswith('EngineeringUnits(') and unit_str.endswith(')'):
+                                        unit_name = unit_str[17:-1]  # Remove "EngineeringUnits(" and ")"
+                                    else:
+                                        unit_name = unit_str
+                                    processed_properties[prop_name] = unit_name
+                                    logging.getLogger(__name__).debug(f"Converted units {prop_value} to {unit_name} for {obj_id}")
+                                except (ImportError, ValueError, TypeError) as e:
+                                    logging.getLogger(__name__).warning(f"Failed to convert units {prop_value} for {obj_id}: {e}")
+                                    processed_properties[prop_name] = make_jsonable(prop_value)
+                            else:
+                                processed_properties[prop_name] = make_jsonable(prop_value)
+                        jsonable_results[str(obj_id)] = processed_properties
+                    else:
+                        jsonable_results[str(obj_id)] = make_jsonable(properties)
+                result['results'] = jsonable_results
+            
+            logging.getLogger(__name__).info(f"Sending paginated response with {len(result.get('results', {}))} object names")
+            
+            return json.dumps(result).encode('utf8')
+        except Exception as e:
+            tb = traceback.format_exc()
+            logging.getLogger(__name__).error(f"Exception in read_object_list_names_endpoint: {e}\n{tb}")
+            return json.dumps({"status": "error", "error": str(e), "traceback": tb}).encode('utf8')
+
+    @callback
+    async def clear_cache_endpoint(self, _, raw_message: bytes):
+        """Endpoint for clearing cache."""
+        message = json.loads(raw_message.decode('utf8'))
+        device_address = message.get('device_address', None)
+        device_object_identifier = message.get('device_object_identifier', None)
+        
+        if device_address:
+            self._clear_cache_for_device(device_address, device_object_identifier)
+            result = {"status": "success", "message": f"Cache cleared for device {device_address}"}
+        else:
+            self._object_list_cache.clear()
+            result = {"status": "success", "message": "All cache cleared"}
+        
+        return json.dumps(result).encode('utf8')
+
+    @callback
+    async def get_cache_stats_endpoint(self, _, raw_message: bytes):
+        """Endpoint for getting cache statistics."""
+        result = self._get_cache_stats()
+        return json.dumps(result).encode('utf8')
+
     @classmethod
     def get_unique_remote_id(cls, unique_remote_id: tuple) -> tuple:
         """Get a unique identifier for the proxy server
@@ -133,6 +340,376 @@ class BACnetProxy(AsyncioProtocolProxy):
         return unique_remote_id[0:2]  # TODO: How can we know what the first two params really are?
                                       #  (Ideally they are address and port.)
                                       #  Consider named tuple?
+
+    async def scan_subnet(self, network_str: str, whois_timeout: float = 3.0) -> list:
+        start_time = time.time()
+        max_scan_duration = 280  # 280 seconds to leave buffer for callback timeout
+        _log.info(f"Starting IP range scan for network: {network_str} with Who-Is timeout: {whois_timeout}s, max scan duration: {max_scan_duration}s")
+        try:
+            net = ipaddress.IPv4Network(network_str, strict=False)
+        except ValueError as e:
+            _log.error(f"Invalid network string '{network_str}': {e}")
+            return []
+        
+        # Check if the network is too large and warn
+        num_hosts = net.num_addresses - 2 if net.num_addresses > 2 else net.num_addresses  # Subtract network and broadcast
+        if num_hosts > 1000:
+            _log.warning(f"Large network scan requested: {num_hosts} hosts. This may take a long time.")
+            
+        tasks = []
+        semaphore = asyncio.Semaphore(20)
+
+        async def scan_host(ip_obj):
+            async with semaphore:
+                try:
+                    ip_str = str(ip_obj)
+                    _log.debug(f"Scanning host {ip_str}")
+                    # Use who_is to discover devices at this IP (note: removed apdu_timeout parameter)
+                    discovered = await self.who_is(0, 4194303, f"{ip_str}:47808")
+                    if discovered:
+                        _log.debug(f"Found {len(discovered)} devices at {ip_str}")
+                        return discovered
+                except Exception as e:
+                    _log.debug(f"Error scanning {ip_obj}: {e}")
+                    return []
+
+        for ip_address_obj in net.hosts():
+            if time.time() - start_time > max_scan_duration:
+                _log.warning(f"Scan time limit reached ({max_scan_duration}s), stopping early")
+                break
+            tasks.append(scan_host(ip_address_obj))
+
+        _log.debug(f"Created {len(tasks)} scan_host tasks for network {network_str}.")
+        gathered_results = await asyncio.gather(*tasks, return_exceptions=True)
+        elapsed_time = time.time() - start_time
+        _log.debug(f"Finished gathering {len(gathered_results)} scan_host results for network {network_str} in {elapsed_time:.2f} seconds.")
+        
+        discovered_devices_final = []
+        scan_aborted = False
+        
+        for result_item in gathered_results:
+            if isinstance(result_item, Exception):
+                _log.debug(f"Exception in scan result: {result_item}")
+                continue
+            if isinstance(result_item, list):
+                discovered_devices_final.extend(result_item)
+
+        final_message = f"IP range scan for {network_str} {'partially completed (time limit reached)' if scan_aborted else 'complete'}. Total devices found: {len(discovered_devices_final)}. Scan time: {elapsed_time:.2f}s"
+        _log.info(final_message)
+        
+        # Add scan metadata to help with debugging
+        if scan_aborted:
+            discovered_devices_final.append({"scan_status": "aborted", "reason": "time_limit_reached"})
+        
+        return discovered_devices_final
+
+    async def read_device_all(self, device_address: str, device_object_identifier: str) -> dict:
+        properties = [
+            "object-identifier",
+            "object-name",
+            "object-type",
+            "system-status",
+            "vendor-name",
+            "vendor-identifier",
+            "model-name",
+            "firmware-revision",
+            "application-software-version",
+            "location",
+            "description",
+            "protocol-version",
+            "protocol-revision",
+            "protocol-services-supported",
+            "protocol-object-types-supported",
+            "object-list",
+            "structured-object-list",
+            "max-apdu-length-accepted",
+            "segmentation-supported",
+            "max-segments-accepted",
+            "vt-classes-supported",
+            "active-vt-sessions",
+            "local-time",
+            "local-date",
+            "utc-offset",
+            "daylight-savings-status",
+            "apdu-segment-timeout",
+            "apdu-timeout",
+            "number-of-apdu-retries",
+            "time-synchronization-recipients",
+            "max-master",
+            "max-info-frames",
+            "device-address-binding",
+            "database-revision",
+            "configuration-files",
+            "last-restore-time",
+            "backup-failure-timeout",
+            "backup-preparation-time",
+            "restore-preparation-time",
+            "restore-completion-time",
+            "backup-and-restore-state",
+            "active-cov-subscriptions",
+            "last-restart-reason",
+            "time-of-device-restart",
+            "restart-notification-recipients",
+            "utc-time-synchronization-recipients",
+            "time-synchronization-interval",
+            "align-intervals",
+            "interval-offset",
+            "serial-number",
+            "property-list",
+            "status-flags",
+            "event-state",
+            "reliability",
+            "event-detection-enable",
+            "notification-class",
+            "event-enable",
+            "acked-transitions",
+            "notify-type",
+            "event-time-stamps",
+            "event-message-texts",
+            "event-message-texts-config",
+            "reliability-evaluation-inhibit",
+            "active-cov-multiple-subscriptions",
+            "audit-notification-recipient",
+            "audit-level",
+            "auditable-operations",
+            "device-uuid",
+            "tags",
+            "profile-location",
+            "deployed-profile-location",
+            "profile-name",
+        ]
+        device_obj = ObjectIdentifier(device_object_identifier)
+        daopr_list = [
+            DeviceAddressObjectPropertyReference(
+                key=prop,
+                device_address=device_address,
+                object_identifier=device_obj,
+                property_reference=PropertyReference(prop)
+            ) for prop in properties
+        ]
+        results = {}
+        def callback(key, value):
+            logging.getLogger(__name__).debug(f"BatchRead callback: key={key}, value={value}")
+            results[key] = value
+        batch = BatchRead(daopr_list)
+        try:
+            await asyncio.wait_for(batch.run(self.bacnet.app, callback=callback), timeout=30)
+        except asyncio.TimeoutError:
+            logging.getLogger(__name__).error("BatchRead timed out after 30 seconds!")
+            results['error'] = 'Timeout waiting for BACnet device response.'
+        except Exception as e:
+            logging.getLogger(__name__).exception(f"Exception in BatchRead: {e}")
+            results['error'] = str(e)
+        return results
+
+    async def _get_cached_object_list(self, device_address: str, device_object_identifier: str):
+        """
+        Get object-list from cache if available and not expired, otherwise read from device.
+        Returns the object-list or None if there was an error.
+        """
+        cache_key = f"{device_address}:{device_object_identifier}"
+        current_time = time.time()
+        
+        # Check cache first
+        if cache_key in self._object_list_cache:
+            object_list, timestamp = self._object_list_cache[cache_key]
+            if current_time - timestamp < self._cache_timeout:
+                _log.debug(f"Using cached object-list for {cache_key}")
+                return object_list
+        
+        # Cache miss or expired - read from device
+        try:
+            _log.debug(f"Reading object-list from device {device_address}")
+            object_list = await self.bacnet.read_property(device_address, device_object_identifier, "object-list")
+            if object_list:
+                self._object_list_cache[cache_key] = (object_list, current_time)
+                _log.debug(f"Cached object-list for {cache_key} with {len(object_list)} objects")
+                return object_list
+        except Exception as e:
+            _log.error(f"Error reading object-list from {device_address}: {e}")
+            return None
+
+    def _clear_cache_for_device(self, device_address: str, device_object_identifier: str = None):
+        """Clear cache for a specific device or all devices."""
+        if device_object_identifier:
+            cache_key = f"{device_address}:{device_object_identifier}"
+            if cache_key in self._object_list_cache:
+                del self._object_list_cache[cache_key]
+                _log.debug(f"Cleared cache for {cache_key}")
+        else:
+            # Clear all entries for this device address
+            keys_to_remove = [key for key in self._object_list_cache.keys() if key.startswith(f"{device_address}:")]
+            for key in keys_to_remove:
+                del self._object_list_cache[key]
+            _log.debug(f"Cleared cache for all objects at {device_address}")
+
+    def _get_cache_stats(self):
+        """Get cache statistics for debugging."""
+        current_time = time.time()
+        stats = {
+            "total_entries": len(self._object_list_cache),
+            "entries": []
+        }
+        
+        for cache_key, (object_list, timestamp) in self._object_list_cache.items():
+            age = current_time - timestamp
+            stats["entries"].append({
+                "device": cache_key,
+                "object_count": len(object_list) if object_list else 0,
+                "age_seconds": age,
+                "expired": age > self._cache_timeout
+            })
+        
+        return stats
+
+    async def read_object_list_names_paginated(self, device_address: str, device_object_identifier: str, page: int = 1, page_size: int = 100) -> dict:
+        """
+        Reads the object-list from a device (with caching), then reads object-name, units, and present-value for a specific page of objects.
+        Returns a paginated response with results and pagination metadata.
+        
+        The results dict will contain object identifiers as keys, with each value being a dict containing:
+        - 'object-name': The name of the object
+        - 'units': The units property of the object (if available)
+        - 'present-value': The current value of the object (if available)
+        """
+        _log.info(f"Starting read_object_list_names_paginated for device {device_address}, page {page}, page_size {page_size}")
+        
+        # Validate pagination parameters
+        if page < 1:
+            return {"error": "Page number must be >= 1"}
+        if page_size < 1 or page_size > 1000:
+            return {"error": "Page size must be between 1 and 1000"}
+        
+        # Step 1: Get object-list from cache or read from device
+        object_list = await self._get_cached_object_list(device_address, device_object_identifier)
+        
+        if object_list is None:
+            return {"error": "Failed to read object-list from device"}
+        
+        total_objects = len(object_list)
+        total_pages = (total_objects + page_size - 1) // page_size
+        
+        _log.info(f"Object-list has {total_objects} objects, {total_pages} total pages")
+        
+        # Calculate pagination bounds
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        
+        # Get the page of objects
+        page_objects = object_list[start_idx:end_idx]
+        
+        if not page_objects:
+            return {"error": "No objects found for this page"}
+        
+        # Step 2: Prepare batch read for object-name, units, and present-value of each object
+        daopr_list = []
+        
+        for objid in page_objects:
+            # Read object-name
+            daopr_list.append(DeviceAddressObjectPropertyReference(
+                key=f"{objid}:object-name",
+                device_address=device_address,
+                object_identifier=objid,
+                property_reference=PropertyReference("object-name")
+            ))
+            # Read units (if applicable)
+            daopr_list.append(DeviceAddressObjectPropertyReference(
+                key=f"{objid}:units",
+                device_address=device_address,
+                object_identifier=objid,
+                property_reference=PropertyReference("units")
+            ))
+            # Read present-value (if applicable)
+            daopr_list.append(DeviceAddressObjectPropertyReference(
+                key=f"{objid}:present-value",
+                device_address=device_address,
+                object_identifier=objid,
+                property_reference=PropertyReference("present-value")
+            ))
+        
+        _log.info(f"Prepared batch read for {len(daopr_list)} objects on page {page}")
+        
+        # Step 3: Execute batch read
+        raw_results = {}
+        def callback(key, value):
+            logging.getLogger(__name__).debug(f"BatchRead callback: key={key}, value={value}")
+            raw_results[key] = value
+        
+        batch = BatchRead(daopr_list)
+        try:
+            await asyncio.wait_for(batch.run(self.bacnet.app, callback=callback), timeout=90)
+            logging.getLogger(__name__).info(f"BatchRead completed successfully with {len(raw_results)} raw results for page {page}")
+            
+            # Check if we have any results after the batch read
+            if not raw_results:
+                logging.getLogger(__name__).warning("BatchRead completed but no results were received")
+                return {"status": "error", "error": "No results received from BACnet device"}
+            
+            # Process raw results to organize by object identifier
+            results = {}
+            for key, value in raw_results.items():
+                if ':' in key:
+                    obj_id, property_name = key.rsplit(':', 1)
+                    if obj_id not in results:
+                        results[obj_id] = {}
+                    results[obj_id][property_name] = value
+                else:
+                    # Fallback for any keys without property suffix
+                    results[key] = value
+            
+        except asyncio.TimeoutError:
+            logging.getLogger(__name__).error(f"BatchRead timed out after 90 seconds for page {page}!")
+            return {"status": "error", "error": "Timeout waiting for BACnet device response after 90 seconds"}
+        except Exception as e:
+            logging.getLogger(__name__).exception(f"Exception in BatchRead for page {page}: {e}")
+            return {"status": "error", "error": f"BatchRead failed: {str(e)}"}
+        
+        # Return paginated response
+        return {
+            "status": "done",
+            "results": results,
+            "pagination": {
+                "page": page,
+                "page_size": page_size,
+                "total_items": total_objects,
+                "total_pages": total_pages,
+                "has_next": page < total_pages,
+                "has_previous": page > 1
+            }
+        }
+
+    async def who_is(self, device_instance_low: int, device_instance_high: int, dest: str):
+        destination_addr = dest if isinstance(dest, Address) else Address(dest)
+        _log.debug(f"Sending Who-Is to {destination_addr} (low_id: {device_instance_low}, high_id: {device_instance_high})")
+        
+        app_instance = None
+        try:
+            app_instance = self.bacnet.app
+            # Perform WHO-IS discovery (note: bacpypes3 who_is doesn't accept apdu_timeout parameter)
+            i_am_responses = await app_instance.who_is(device_instance_low, device_instance_high, destination_addr)
+            _log.debug(f"Received {len(i_am_responses)} I-Am response(s) from {destination_addr}")
+            
+            devices_found = []
+            if i_am_responses:
+                for i_am_pdu in i_am_responses:
+                    device_info = {
+                        "pduSource": str(i_am_pdu.pduSource),
+                        "deviceIdentifier": i_am_pdu.iAmDeviceIdentifier,
+                        "maxAPDULengthAccepted": i_am_pdu.maxAPDULengthAccepted,
+                        "segmentationSupported": str(i_am_pdu.segmentationSupported),
+                        "vendorID": i_am_pdu.vendorID,
+                    }
+                    devices_found.append(device_info)
+            return devices_found
+        except asyncio.TimeoutError:
+            _log.warning(f"Who-Is timeout for {destination_addr}")
+            return []
+        except ErrorRejectAbortNack as e_bac:
+            _log.warning(f"BACnet error during Who-Is: {e_bac}")
+            return []
+        except Exception as e_gen:
+            _log.error(f"General error during Who-Is: {e_gen}")
+            return []
 
 
 class BACnet:
@@ -306,7 +883,7 @@ async def run_proxy(local_device_address, **kwargs):
     await bp.start()
 
 
-def launch_bacnet(parser: ArgumentParser) -> (ArgumentParser, Type[AsyncioProtocolProxy]):
+def launch_bacnet(parser: ArgumentParser) -> [ArgumentParser, Type[AsyncioProtocolProxy]]: # type: ignore
     parser.add_argument('--local-device-address', type=str, required=True,
                         help='Address on the local machine of this BACnet Proxy.')
     parser.add_argument('--bacnet-network', type=int, default=0,
