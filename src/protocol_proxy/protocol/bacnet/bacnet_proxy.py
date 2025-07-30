@@ -17,7 +17,7 @@ from bacpypes3.constructeddata import AnyAtomic
 from bacpypes3.lib.batchread import BatchRead, DeviceAddressObjectPropertyReference
 from bacpypes3.pdu import Address, PDUData
 from bacpypes3.apdu import (ConfirmedPrivateTransferACK, ConfirmedPrivateTransferError, ConfirmedPrivateTransferRequest,
-                            ErrorRejectAbortNack, TimeSynchronizationRequest)
+                            ErrorRejectAbortNack, TimeSynchronizationRequest, AbortPDU, ErrorPDU, RejectPDU)
 from bacpypes3.primitivedata import ClosingTag, Date, Null, ObjectIdentifier, ObjectType, OpeningTag, Tag, TagList, Time
 from bacpypes3.vendor import get_vendor_info
 
@@ -58,6 +58,35 @@ class BACnetProxy(AsyncioProtocolProxy):
         self.register_callback(self.clear_cache_endpoint, 'CLEAR_CACHE', provides_response=True)
         self.register_callback(self.get_cache_stats_endpoint, 'GET_CACHE_STATS', provides_response=True)
 
+    def _handle_bacnet_response(self, result):
+        """Helper method to handle BACnet responses and convert errors to JSON-serializable format."""
+        if isinstance(result, AbortPDU):
+            return {
+                "error": "AbortPDU",
+                "reason": str(result.apduAbortRejectReason) if hasattr(result, 'apduAbortRejectReason') else "Unknown abort reason",
+                "details": str(result)
+            }
+        elif isinstance(result, ErrorPDU):
+            return {
+                "error": "ErrorPDU", 
+                "error_class": str(result.errorClass) if hasattr(result, 'errorClass') else "Unknown",
+                "error_code": str(result.errorCode) if hasattr(result, 'errorCode') else "Unknown",
+                "details": str(result)
+            }
+        elif isinstance(result, RejectPDU):
+            return {
+                "error": "RejectPDU",
+                "reason": str(result.apduAbortRejectReason) if hasattr(result, 'apduAbortRejectReason') else "Unknown reject reason",
+                "details": str(result)
+            }
+        elif isinstance(result, ErrorRejectAbortNack):
+            return {
+                "error": "ErrorRejectAbortNack",
+                "details": str(result)
+            }
+        else:
+            return result
+
     @callback
     async def confirmed_private_transfer_endpoint(self, _, raw_message: bytes):
         """Endpoint for confirmed private transfer."""
@@ -77,7 +106,10 @@ class BACnetProxy(AsyncioProtocolProxy):
         address = message['address']
         property_name = message.get('property_name', 'object-identifier')
         result = await self.bacnet.query_device(address, property_name)
-        return json.dumps(result).encode('utf8')
+        
+        # Handle BACnet responses (including errors)
+        handled_result = self._handle_bacnet_response(result)
+        return json.dumps(handled_result).encode('utf8')
 
     @callback
     async def read_property_endpoint(self, _, raw_message: bytes):
@@ -88,7 +120,38 @@ class BACnetProxy(AsyncioProtocolProxy):
         property_identifier = message['property_identifier']
         property_array_index = message.get('property_array_index', None)
         result = await self.bacnet.read_property(address, object_identifier, property_identifier, property_array_index)
-        return json.dumps(result).encode('utf8')
+        def make_jsonable(val):
+            if isinstance(val, (list, tuple)):
+                return [make_jsonable(v) for v in val]
+            if isinstance(val, (bytes, bytearray)):
+                return val.hex()
+            if hasattr(val, 'as_tuple'):
+                return str(val)
+            if hasattr(val, '__dict__') and not isinstance(val, type):
+                return {k: make_jsonable(v) for k, v in val.__dict__.items()}
+            if hasattr(val, '__class__') and 'Error' in val.__class__.__name__:
+                return str(val)
+            import ipaddress
+            if isinstance(val, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
+                return str(val)
+            return val
+        jsonable_result = make_jsonable(result)
+        try:
+            if isinstance(result, ErrorRejectAbortNack):
+                error_response = {
+                    "error": type(result).__name__,
+                    "details": str(result)
+                }
+                return json.dumps(error_response).encode('utf8')
+            return json.dumps(jsonable_result).encode('utf8')
+        except TypeError as e:
+            error_response = {
+                "error": "SerializationError",
+                "details": str(e),
+                "raw_type": str(type(result)),
+                "raw_str": str(result)
+            }
+            return json.dumps(error_response).encode('utf8')
 
     @callback
     async def read_property_multiple_endpoint(self, _, raw_message: bytes):
@@ -97,7 +160,10 @@ class BACnetProxy(AsyncioProtocolProxy):
         address = message['device_address']
         read_specifications = message['read_specifications']
         result = await self.bacnet.read_property_multiple(address, read_specifications)
-        return json.dumps(result).encode('utf8')
+        
+        # Handle BACnet responses (including errors)
+        handled_result = self._handle_bacnet_response(result)
+        return json.dumps(handled_result).encode('utf8')
 
     @callback
     async def send_object_user_lock_time_endpoint(self, _, raw_message: bytes):
@@ -744,21 +810,21 @@ class BACnet:
 
     async def read_property(self, device_address: str, object_identifier: str, property_identifier: str,
                    property_array_index: int | None = None):
-        # TODO: How to handle timeout (what if target is not there)?
         try:
-            _log.debug(f'Reading property {property_identifier} from {object_identifier} at {device_address}')
+            _log.debug(f"BACnet.read_property called with device_address={device_address}, object_identifier={object_identifier}, property_identifier={property_identifier}, property_array_index={property_array_index}")
             response = await self.app.read_property(
                 Address(device_address),
                 ObjectIdentifier(object_identifier),
                 property_identifier,
                 int(property_array_index) if property_array_index is not None else None
             )
+            _log.debug(f"BACnet.read_property response: {response}")
         except ErrorRejectAbortNack as err:
             _log.debug(f'Error reading property {err}')
             response = err
         if isinstance(response, AnyAtomic):
             response = response.get_value()
-        # _log.debug(f'Response from read_property: {response}')
+        _log.debug(f"BACnet.read_property final response: {response}")
         return response
 
     async def read_property_multiple(self, device_address: str, read_specifications: list):
@@ -883,7 +949,7 @@ async def run_proxy(local_device_address, **kwargs):
     await bp.start()
 
 
-def launch_bacnet(parser: ArgumentParser) -> [ArgumentParser, Type[AsyncioProtocolProxy]]: # type: ignore
+def launch_bacnet(parser: ArgumentParser) -> tuple[ArgumentParser, Type[AsyncioProtocolProxy]]:
     parser.add_argument('--local-device-address', type=str, required=True,
                         help='Address on the local machine of this BACnet Proxy.')
     parser.add_argument('--bacnet-network', type=int, default=0,
