@@ -248,12 +248,44 @@ class BACnetProxy(AsyncioProtocolProxy):
 
     @callback
     async def scan_subnet_endpoint(self, _, raw_message: bytes):
-        """Endpoint for subnet scanning."""
-        message = json.loads(raw_message.decode('utf8'))
-        network_str = message['network']
-        whois_timeout = message.get('whois_timeout', 3.0)
-        result = await self.scan_subnet(network_str, whois_timeout)
-        return json.dumps(result).encode('utf8')
+        """Endpoint for subnet scanning.
+           Input JSON (all optional except network):
+             {
+               "network": "192.168.1.0/24",
+               "whois_timeout": 2.0,
+               "port": 47808,
+               "low_id": 0,
+               "high_id": 4194303,
+               "enable_brute_force": true,
+               "semaphore_limit": 20,
+               "max_duration": 280.0
+             }
+           Backward compatible: old payload with only network still works.
+        """
+        try:
+            message = json.loads(raw_message.decode('utf8'))
+            network_str = message['network']
+            whois_timeout = float(message.get('whois_timeout', 2.0))
+            port = int(message.get('port', 47808))
+            low_id = int(message.get('low_id', 0))
+            high_id = int(message.get('high_id', 4194303))
+            enable_brute_force = bool(message.get('enable_brute_force', True))
+            semaphore_limit = int(message.get('semaphore_limit', 20))
+            max_duration = float(message.get('max_duration', 280.0))
+            result = await self.scan_subnet(
+                network_str,
+                whois_timeout=whois_timeout,
+                port=port,
+                low_id=low_id,
+                high_id=high_id,
+                enable_brute_force=enable_brute_force,
+                semaphore_limit=semaphore_limit,
+                max_duration=max_duration
+            )
+            return json.dumps(result).encode('utf8')
+        except Exception as e:
+            _log.error(f"scan_subnet_endpoint error: {e}")
+            return json.dumps({"error": str(e)}).encode('utf8')
 
     @callback
     async def read_object_list_names_endpoint(self, _, raw_message: bytes):
@@ -407,67 +439,112 @@ class BACnetProxy(AsyncioProtocolProxy):
                                       #  (Ideally they are address and port.)
                                       #  Consider named tuple?
 
-    async def scan_subnet(self, network_str: str, whois_timeout: float = 3.0) -> list:
+    async def scan_subnet(
+        self, 
+        network_str: str, 
+        whois_timeout: float = 3.0,
+        port: int = 47808,
+        low_id: int = 0,
+        high_id: int = 4194303,
+        enable_brute_force: bool = True,
+        semaphore_limit: int = 20,
+        max_duration: float = 280.0
+    ) -> list:
+        """
+        Hybrid subnet scan:
+          1. Directed broadcast Who-Is (subnet broadcast)
+          2. Limited broadcast Who-Is (255.255.255.255)
+          3. Brute force unicast sweep (only if no devices found from broadcasts)
+
+        Parameters (all have defaults to preserve old behavior):
+          network_str        CIDR (e.g. 192.168.1.0/24)
+          whois_timeout      Seconds to wait per broadcast (wait_for timeout)
+          port               UDP BACnet port to target (default 47808)
+          low_id / high_id   Device instance range filter (default 0-4194303)
+          enable_brute_force Whether to fall back to per-host unicast if broadcasts find nothing
+          semaphore_limit    Concurrency for brute force sweep (default 20)
+          max_duration       Safety cap (seconds) for brute force phase (default 280)
+        Returns: list[device_dict]
+        """
+
         start_time = time.time()
-        max_scan_duration = 280  # 280 seconds to leave buffer for callback timeout
-        _log.info(f"Starting IP range scan for network: {network_str} with Who-Is timeout: {whois_timeout}s, max scan duration: {max_scan_duration}s")
+
         try:
             net = ipaddress.IPv4Network(network_str, strict=False)
         except ValueError as e:
-            _log.error(f"Invalid network string '{network_str}': {e}")
+            _log.error(f"[scan_subnet] Invalid network string '{network_str}': {e}")
             return []
-        
-        # Check if the network is too large and warn
-        num_hosts = net.num_addresses - 2 if net.num_addresses > 2 else net.num_addresses  # Subtract network and broadcast
-        if num_hosts > 1000:
-            _log.warning(f"Large network scan requested: {num_hosts} hosts. This may take a long time.")
-            
-        tasks = []
-        semaphore = asyncio.Semaphore(20)
 
-        async def scan_host(ip_obj):
-            async with semaphore:
-                try:
-                    ip_str = str(ip_obj)
-                    _log.debug(f"Scanning host {ip_str}")
-                    # Use who_is to discover devices at this IP (note: removed apdu_timeout parameter)
-                    discovered = await self.who_is(0, 4194303, f"{ip_str}:47808")
-                    if discovered:
-                        _log.debug(f"Found {len(discovered)} devices at {ip_str}")
-                        return discovered
-                except Exception as e:
-                    _log.debug(f"Error scanning {ip_obj}: {e}")
-                    return []
+        discovered: list[dict] = []
+        seen_keys: set = set()
 
-        for ip_address_obj in net.hosts():
-            if time.time() - start_time > max_scan_duration:
-                _log.warning(f"Scan time limit reached ({max_scan_duration}s), stopping early")
-                break
-            tasks.append(scan_host(ip_address_obj))
+        def add_devices(devs: list[dict] | None):
+            if not devs:
+                return
+            for d in devs:
+                key = (d.get("pduSource"), tuple(d.get("deviceIdentifier", [])))
+                if key not in seen_keys:
+                    discovered.append(d)
+                    seen_keys.add(key)
 
-        _log.debug(f"Created {len(tasks)} scan_host tasks for network {network_str}.")
-        gathered_results = await asyncio.gather(*tasks, return_exceptions=True)
-        elapsed_time = time.time() - start_time
-        _log.debug(f"Finished gathering {len(gathered_results)} scan_host results for network {network_str} in {elapsed_time:.2f} seconds.")
-        
-        discovered_devices_final = []
-        scan_aborted = False
-        
-        for result_item in gathered_results:
-            if isinstance(result_item, Exception):
-                _log.debug(f"Exception in scan result: {result_item}")
-                continue
-            if isinstance(result_item, list):
-                discovered_devices_final.extend(result_item)
+        # 1. Directed broadcast
+        directed_broadcast = f"{net.broadcast_address}:{port}"
+        _log.debug(f"[scan_subnet] Directed broadcast Who-Is -> {directed_broadcast}")
+        try:
+            resp = await asyncio.wait_for(self.who_is(low_id, high_id, directed_broadcast), timeout=whois_timeout)
+            add_devices(resp)
+        except asyncio.TimeoutError:
+            _log.debug("[scan_subnet] Directed broadcast timeout (continuing)")
+        except Exception as e:
+            _log.debug(f"[scan_subnet] Directed broadcast error: {e}")
 
-        final_message = f"IP range scan for {network_str} {'partially completed (time limit reached)' if scan_aborted else 'complete'}. Total devices found: {len(discovered_devices_final)}. Scan time: {elapsed_time:.2f}s"
-        _log.info(final_message)
-        
-        # Add scan metadata to help with debugging
-        if scan_aborted:
-            discovered_devices_final.append({"scan_status": "aborted", "reason": "time_limit_reached"})
-        
-        return discovered_devices_final
+        # 2. Limited broadcast if none found yet
+        if not discovered:
+            limited_broadcast = f"255.255.255.255:{port}"
+            _log.debug(f"[scan_subnet] Limited broadcast Who-Is -> {limited_broadcast}")
+            try:
+                resp = await asyncio.wait_for(self.who_is(low_id, high_id, limited_broadcast), timeout=whois_timeout)
+                add_devices(resp)
+            except asyncio.TimeoutError:
+                _log.debug("[scan_subnet] Limited broadcast timeout (continuing)")
+            except Exception as e:
+                _log.debug(f"[scan_subnet] Limited broadcast error: {e}")
+
+        # 3. Brute force unicast sweep (only if still nothing)
+        if not discovered and enable_brute_force:
+            host_count = sum(1 for _ in net.hosts())
+            if host_count > 1024:
+                _log.warning(f"[scan_subnet] Large network sweep: {host_count} hosts")
+
+            _log.debug(f"[scan_subnet] Starting unicast sweep over {network_str} port={port} concurrency={semaphore_limit}")
+            sem = asyncio.Semaphore(semaphore_limit)
+
+            async def probe(ip_obj):
+                async with sem:
+                    if time.time() - start_time > max_duration:
+                        return
+                    dest = f"{ip_obj}:{port}"
+                    try:
+                        resp = await self.who_is(low_id, high_id, dest)
+                        if resp:
+                            _log.debug(f"[scan_subnet] Unicast hit {dest} -> {len(resp)} device(s)")
+                            add_devices(resp)
+                    except Exception:
+                        pass  # per-host errors are non-fatal
+
+            tasks = []
+            for host_ip in net.hosts():
+                if time.time() - start_time > max_duration:
+                    _log.warning("[scan_subnet] Time limit reached; stopping sweep early")
+                    break
+                tasks.append(asyncio.create_task(probe(host_ip)))
+
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        elapsed = time.time() - start_time
+        _log.info(f"[scan_subnet] Complete devices_found={len(discovered)} elapsed={elapsed:.2f}s")
+        return discovered
 
     async def read_device_all(self, device_address: str, device_object_identifier: str) -> dict:
         properties = [
