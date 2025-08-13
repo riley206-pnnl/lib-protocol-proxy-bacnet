@@ -142,14 +142,19 @@ class BACnetProxy(AsyncioProtocolProxy):
                     'networks_found_on': network_str
                 }
             
-            # Write back
+            # Write back CSV
             with open(device_cache_file, 'w', newline='') as f:
                 fieldnames = ['device_instance', 'device_address', 'vendor_id', 'first_discovered', 'last_seen', 'scan_count', 'networks_found_on']
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(existing.values())
+            
+            # Also save JSON copy
+            device_json_file = cache_dir / 'discovered_devices.json'
+            with open(device_json_file, 'w') as f:
+                json.dump(list(existing.values()), f, indent=2)
                 
-            _log.info(f"Saved device {device_instance} at {device_address} to {device_cache_file}")
+            _log.info(f"Saved device {device_instance} at {device_address} to {device_cache_file} and JSON")
             
         except Exception as e:
             _log.error(f"Error saving device: {e}")
@@ -908,7 +913,7 @@ class BACnetProxy(AsyncioProtocolProxy):
                     'read_count': '1'
                 }
             
-            # Write back
+            # Write back CSV
             with open(object_cache_file, 'w', newline='') as f:
                 fieldnames = [
                     'device_address', 'device_object_identifier', 'object_id', 
@@ -919,7 +924,12 @@ class BACnetProxy(AsyncioProtocolProxy):
                 writer.writeheader()
                 writer.writerows(existing.values())
             
-            _log.debug(f"Saved object {object_id} properties for device {device_address}")
+            # Also save JSON copy
+            object_json_file = cache_dir / 'object_properties.json'
+            with open(object_json_file, 'w') as f:
+                json.dump(list(existing.values()), f, indent=2)
+            
+            _log.debug(f"Saved object {object_id} properties for device {device_address} to CSV and JSON")
             
         except Exception as e:
             _log.error(f"Error saving object properties: {e}")
