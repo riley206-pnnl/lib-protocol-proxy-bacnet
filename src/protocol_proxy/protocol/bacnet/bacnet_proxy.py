@@ -5,6 +5,8 @@ import logging
 import sys
 import time
 import traceback
+import os
+import csv
 
 from argparse import ArgumentParser
 from datetime import datetime
@@ -25,7 +27,7 @@ from protocol_proxy.ipc import callback
 from protocol_proxy.proxy import launch
 from protocol_proxy.proxy.asyncio import AsyncioProtocolProxy
 
-logging.basicConfig(filename='/tmp/bacnet_proxy.log', level=logging.DEBUG,
+logging.basicConfig(filename='/home/riley/VOLTTRON/volttron_bacnet_stuff/1_scan_tool/bacnet_proxy.log', level=logging.DEBUG,
                     format='%(asctime)s - %(message)s')
 _log = logging.getLogger(__name__)
 
@@ -86,6 +88,124 @@ class BACnetProxy(AsyncioProtocolProxy):
             }
         else:
             return result
+        
+    def save_discovered_device(self, device_info: dict, network_str: str, scan_method: str = "unknown"):
+        """Save a discovered device to CSV cache."""
+        try:
+            device_instance = device_info.get('deviceIdentifier', [None, None])[1]
+            device_address = device_info.get('pduSource', '').split(':')[0]
+            
+            if not device_instance or not device_address:
+                return
+            
+            # Set up cache file path (create directory if needed)
+            from pathlib import Path
+            cache_dir = Path.home() / '.bacnet_scan_tool'
+            cache_dir.mkdir(exist_ok=True)
+            device_cache_file = cache_dir / 'discovered_devices.csv'
+                
+            # Create CSV if it doesn't exist
+            if not device_cache_file.exists():
+                with open(device_cache_file, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['device_instance', 'device_address', 'vendor_id', 'first_discovered', 'last_seen', 'scan_count', 'networks_found_on'])
+            
+            # Read existing data
+            existing = {}
+            with open(device_cache_file, 'r', newline='') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    existing[(row['device_instance'], row['device_address'])] = row
+            
+            # Update or create record
+            key = (str(device_instance), device_address)
+            now = datetime.now().isoformat()
+            
+            if key in existing:
+                # Update existing
+                existing[key]['last_seen'] = now
+                existing[key]['scan_count'] = str(int(existing[key]['scan_count']) + 1)
+                networks = existing[key]['networks_found_on'].split(';') if existing[key]['networks_found_on'] else []
+                if network_str not in networks:
+                    networks.append(network_str)
+                existing[key]['networks_found_on'] = ';'.join(networks)
+            else:
+                # New device
+                existing[key] = {
+                    'device_instance': str(device_instance),
+                    'device_address': device_address,
+                    'vendor_id': str(device_info.get('vendorID', '')),
+                    'first_discovered': now,
+                    'last_seen': now,
+                    'scan_count': '1',
+                    'networks_found_on': network_str
+                }
+            
+            # Write back
+            with open(device_cache_file, 'w', newline='') as f:
+                fieldnames = ['device_instance', 'device_address', 'vendor_id', 'first_discovered', 'last_seen', 'scan_count', 'networks_found_on']
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(existing.values())
+                
+            _log.info(f"Saved device {device_instance} at {device_address} to {device_cache_file}")
+            
+        except Exception as e:
+            _log.error(f"Error saving device: {e}")
+
+    def load_cached_devices(self, network_str: str = None) -> list:
+        """Load cached devices from CSV file.
+        
+        Args:
+            network_str: Optional network filter (e.g., "192.168.1.0/24")
+                        If provided, only returns devices found on that network
+                        
+        Returns:
+            list: Devices in same format as scan_subnet returns
+        """
+        try:
+            from pathlib import Path
+            cache_dir = Path.home() / '.bacnet_scan_tool'
+            device_cache_file = cache_dir / 'discovered_devices.csv'
+            
+            if not device_cache_file.exists():
+                _log.debug("No device cache file found")
+                return []
+            
+            devices = []
+            with open(device_cache_file, 'r', newline='') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    # Filter by network if specified
+                    if network_str:
+                        networks = row.get('networks_found_on', '').split(';') if row.get('networks_found_on') else []
+                        if network_str not in networks:
+                            continue
+                    
+                    # Convert back to scan_subnet format
+                    device = {
+                        'pduSource': f"{row['device_address']}:47808",
+                        'deviceIdentifier': ['device', int(row['device_instance'])],
+                        'vendorID': int(row['vendor_id']) if row['vendor_id'] and row['vendor_id'].isdigit() else None,
+                        'vendorName': '',  # Could be looked up from vendor_id
+                        'maxAPDULengthAccepted': None,  # Not stored in cache
+                        'segmentationSupported': None,  # Not stored in cache
+                        '_cached': True,  # Mark as from cache
+                        '_cache_info': {
+                            'first_discovered': row['first_discovered'],
+                            'last_seen': row['last_seen'],
+                            'scan_count': int(row['scan_count']) if row['scan_count'].isdigit() else 0,
+                            'networks': row.get('networks_found_on', '').split(';') if row.get('networks_found_on') else []
+                        }
+                    }
+                    devices.append(device)
+            
+            _log.info(f"Loaded {len(devices)} cached devices" + (f" for network {network_str}" if network_str else ""))
+            return devices
+            
+        except Exception as e:
+            _log.error(f"Error loading cached devices: {e}")
+            return []
 
     @callback
     async def confirmed_private_transfer_endpoint(self, _, raw_message: bytes):
@@ -258,7 +378,8 @@ class BACnetProxy(AsyncioProtocolProxy):
                "high_id": 4194303,
                "enable_brute_force": true,
                "semaphore_limit": 20,
-               "max_duration": 280.0
+               "max_duration": 280.0,
+               "force_fresh_scan": false
              }
            Backward compatible: old payload with only network still works.
         """
@@ -272,6 +393,7 @@ class BACnetProxy(AsyncioProtocolProxy):
             enable_brute_force = bool(message.get('enable_brute_force', True))
             semaphore_limit = int(message.get('semaphore_limit', 20))
             max_duration = float(message.get('max_duration', 280.0))
+            force_fresh_scan = bool(message.get('force_fresh_scan', False))
             result = await self.scan_subnet(
                 network_str,
                 whois_timeout=whois_timeout,
@@ -280,7 +402,8 @@ class BACnetProxy(AsyncioProtocolProxy):
                 high_id=high_id,
                 enable_brute_force=enable_brute_force,
                 semaphore_limit=semaphore_limit,
-                max_duration=max_duration
+                max_duration=max_duration,
+                force_fresh_scan=force_fresh_scan
             )
             return json.dumps(result).encode('utf8')
         except Exception as e:
@@ -448,13 +571,15 @@ class BACnetProxy(AsyncioProtocolProxy):
         high_id: int = 4194303,
         enable_brute_force: bool = True,
         semaphore_limit: int = 20,
-        max_duration: float = 280.0
+        max_duration: float = 280.0,
+        force_fresh_scan: bool = False
     ) -> list:
         """
         Hybrid subnet scan:
-          1. Directed broadcast Who-Is (subnet broadcast)
-          2. Limited broadcast Who-Is (255.255.255.255)
-          3. Brute force unicast sweep (only if no devices found from broadcasts)
+          1. Check cache first (unless force_fresh_scan=True)
+          2. Directed broadcast Who-Is (subnet broadcast)
+          3. Limited broadcast Who-Is (255.255.255.255)
+          4. Brute force unicast sweep (only if no devices found from broadcasts)
 
         Parameters (all have defaults to preserve old behavior):
           network_str        CIDR (e.g. 192.168.1.0/24)
@@ -464,10 +589,18 @@ class BACnetProxy(AsyncioProtocolProxy):
           enable_brute_force Whether to fall back to per-host unicast if broadcasts find nothing
           semaphore_limit    Concurrency for brute force sweep (default 20)
           max_duration       Safety cap (seconds) for brute force phase (default 280)
+          force_fresh_scan   If True, skip cache and force fresh network scan (default False)
         Returns: list[device_dict]
         """
 
         start_time = time.time()
+
+        # Handle cache logic - check cache unless force_fresh_scan is True
+        if not force_fresh_scan:
+            cached_devices = self.load_cached_devices(network_str)
+            if cached_devices:
+                _log.info(f"[scan_subnet] Returning {len(cached_devices)} cached devices for {network_str}")
+                return cached_devices
 
         try:
             net = ipaddress.IPv4Network(network_str, strict=False)
@@ -541,6 +674,9 @@ class BACnetProxy(AsyncioProtocolProxy):
 
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+
+        for device in discovered:
+            self.save_discovered_device(device, network_str, "scan")
 
         elapsed = time.time() - start_time
         _log.info(f"[scan_subnet] Complete devices_found={len(discovered)} elapsed={elapsed:.2f}s")
