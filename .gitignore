@@ -1,3 +1,5 @@
+# Ignore network discovery script
+run_network_discovery.py
 .coverage*
 pip-wheel-metadata/
 site/
@@ -166,3 +168,47 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# =============================================================================
+# TEST RUNNING INSTRUCTIONS
+# =============================================================================
+# 
+# To run the BACnet Scanner tests:
+# 
+# 1. Install dependencies:
+#    pip install pytest pytest-asyncio
+# 
+# 2. Run all tests:
+#    pytest tests/
+# 
+# 3. Run specific test file:
+#    pytest tests/test_bacnet_scanner.py
+# 
+# 4. Run specific test method:
+#    pytest tests/test_bacnet_scanner.py::TestBacnetScanner::test_automatic_network_discovery_through_routers
+# 
+# 5. Run tests with verbose output:
+#    pytest -v tests/
+# 
+# 6. Run tests and show coverage:
+#    pytest --cov=src tests/
+# 
+# 7. Run tests in the background with output:
+#    pytest -s tests/
+# 
+# Note: The automatic network discovery tests will fail until the following methods
+# are implemented in the BacnetScanner class:
+# - _discover_all_networks_automatically()
+# - _scan_network_for_routers()
+# - _get_reachable_networks_from_router()
+# - _scan_network_through_router()
+# - _automatic_discovery_with_loop_detection()
+# - _deep_network_discovery()
+# - _concurrent_network_discovery()
+# - _discovery_with_errors()
+# 
+# =============================================================================
+
+# Local test files and directories
+local_tests/
+local_test/
