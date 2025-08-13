@@ -2,6 +2,7 @@ import asyncio
 import ipaddress
 import json
 import logging
+import re
 import sys
 import time
 import traceback
@@ -179,6 +180,8 @@ class BACnetProxy(AsyncioProtocolProxy):
                     # Filter by network if specified
                     if network_str:
                         networks = row.get('networks_found_on', '').split(';') if row.get('networks_found_on') else []
+                        if network_str not in networks:
+                            continuenetworks = row.get('networks_found_on', '').split(';') if row.get('networks_found_on') else []
                         if network_str not in networks:
                             continue
                     
@@ -412,21 +415,22 @@ class BACnetProxy(AsyncioProtocolProxy):
 
     @callback
     async def read_object_list_names_endpoint(self, _, raw_message: bytes):
-        """Endpoint for reading object-list and object-names from a BACnet device with pagination."""
+        """Endpoint for reading object-list and object-names from a BACnet device with pagination and caching."""
         try:
             message = json.loads(raw_message.decode('utf8'))
             device_address = message['device_address']
             device_object_identifier = message['device_object_identifier']
             page = message.get('page', 1)
             page_size = message.get('page_size', 100)
+            force_fresh_read = message.get('force_fresh_read', False)  # New parameter
             
-            logging.getLogger(__name__).info(f"read_object_list_names_endpoint called for device {device_address}, page {page}, page_size {page_size}")
+            logging.getLogger(__name__).info(f"read_object_list_names_endpoint called for device {device_address}, page {page}, page_size {page_size}, force_fresh_read={force_fresh_read}")
             
             # Check if the BACnet application is still connected
             if not hasattr(self.bacnet, 'app') or self.bacnet.app is None:
                 return json.dumps({"status": "error", "error": "BACnet application not available"}).encode('utf8')
             
-            result = await self.read_object_list_names_paginated(device_address, device_object_identifier, page, page_size)
+            result = await self.read_object_list_names_paginated(device_address, device_object_identifier, page, page_size, force_fresh_read)
             
             logging.getLogger(__name__).info(f"read_object_list_names_paginated returned response with status: {result.get('status')}")
             
@@ -523,8 +527,6 @@ class BACnetProxy(AsyncioProtocolProxy):
                     else:
                         jsonable_results[str(obj_id)] = make_jsonable(properties)
                 result['results'] = jsonable_results
-            
-            logging.getLogger(__name__).info(f"Sending paginated response with {len(result.get('results', {}))} object names")
             
             return json.dumps(result).encode('utf8')
         except Exception as e:
@@ -841,29 +843,191 @@ class BACnetProxy(AsyncioProtocolProxy):
         
         return stats
 
-    async def read_object_list_names_paginated(self, device_address: str, device_object_identifier: str, page: int = 1, page_size: int = 100) -> dict:
+    def save_object_properties(self, device_address: str, device_object_identifier: str, object_id: str, properties: dict):
+        """Save object properties to CSV cache."""
+        try:
+            from pathlib import Path
+            cache_dir = Path.home() / '.bacnet_scan_tool'
+            cache_dir.mkdir(exist_ok=True)
+            object_cache_file = cache_dir / 'object_properties.csv'
+            
+            # Create CSV if it doesn't exist
+            if not object_cache_file.exists():
+                with open(object_cache_file, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        'device_address', 'device_object_identifier', 'object_id', 
+                        'object_name', 'units', 'present_value', 'object_type',
+                        'first_discovered', 'last_updated', 'read_count'
+                    ])
+            
+            # Read existing data
+            existing = {}
+            with open(object_cache_file, 'r', newline='') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    key = (row['device_address'], row['device_object_identifier'], row['object_id'])
+                    existing[key] = row
+            
+            # Helper function to safely convert property values
+            def safe_property_value(value):
+                if value is None:
+                    return ""
+                # Check if it's an ErrorType object
+                if hasattr(value, '__class__') and 'ErrorType' in str(value.__class__):
+                    return ""  # Skip error values
+                return str(value)
+            
+            # Update or create record
+            key = (device_address, device_object_identifier, object_id)
+            now = datetime.now().isoformat()
+            
+            if key in existing:
+                # Update existing
+                existing[key]['last_updated'] = now
+                existing[key]['read_count'] = str(int(existing[key]['read_count']) + 1)
+                # Update properties if they exist and aren't errors
+                if 'object-name' in properties:
+                    existing[key]['object_name'] = safe_property_value(properties['object-name'])
+                if 'units' in properties:
+                    existing[key]['units'] = safe_property_value(properties['units'])
+                if 'present-value' in properties:
+                    existing[key]['present_value'] = safe_property_value(properties['present-value'])
+            else:
+                # New object
+                existing[key] = {
+                    'device_address': device_address,
+                    'device_object_identifier': device_object_identifier,
+                    'object_id': object_id,
+                    'object_name': safe_property_value(properties.get('object-name', '')),
+                    'units': safe_property_value(properties.get('units', '')),
+                    'present_value': safe_property_value(properties.get('present-value', '')),
+                    'object_type': str(properties.get('object-type', '')),
+                    'first_discovered': now,
+                    'last_updated': now,
+                    'read_count': '1'
+                }
+            
+            # Write back
+            with open(object_cache_file, 'w', newline='') as f:
+                fieldnames = [
+                    'device_address', 'device_object_identifier', 'object_id', 
+                    'object_name', 'units', 'present_value', 'object_type',
+                    'first_discovered', 'last_updated', 'read_count'
+                ]
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(existing.values())
+            
+            _log.debug(f"Saved object {object_id} properties for device {device_address}")
+            
+        except Exception as e:
+            _log.error(f"Error saving object properties: {e}")
+
+    def load_cached_object_properties(self, device_address: str, device_object_identifier: str, page: int = 1, page_size: int = 100) -> dict:
+        """Load cached object properties from CSV file with pagination."""
+        try:
+            from pathlib import Path
+            cache_dir = Path.home() / '.bacnet_scan_tool'
+            object_cache_file = cache_dir / 'object_properties.csv'
+            
+            if not object_cache_file.exists():
+                _log.debug("No object properties cache file found")
+                return None
+            
+            # Read all objects for this device
+            device_objects = []
+            with open(object_cache_file, 'r', newline='') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if (row['device_address'] == device_address and 
+                        row['device_object_identifier'] == device_object_identifier):
+                        device_objects.append(row)
+            
+            if not device_objects:
+                _log.debug(f"No cached objects found for device {device_address}")
+                return None
+            
+            # Calculate pagination based on cached objects
+            total_cached_objects = len(device_objects)
+            total_cached_pages = (total_cached_objects + page_size - 1) // page_size
+            
+            # Check if the requested page exists in our cache
+            if page > total_cached_pages:
+                _log.debug(f"Requested page {page} is beyond cached data (cached pages: {total_cached_pages}), falling back to fresh read")
+                return None  # Fall back to fresh read
+            
+            # We have this page in cache, return it
+            start_idx = (page - 1) * page_size
+            end_idx = start_idx + page_size
+            page_objects = device_objects[start_idx:end_idx]
+            
+            # Convert to expected format
+            results = {}
+            for obj in page_objects:
+                obj_id = obj['object_id']
+                results[obj_id] = {
+                    'object-name': obj['object_name'] if obj['object_name'] else None,
+                    'units': obj['units'] if obj['units'] else None,
+                    'present-value': obj['present_value'] if obj['present_value'] else None,
+                    '_cached': True,
+                    '_cache_info': {
+                        'first_discovered': obj['first_discovered'],
+                        'last_updated': obj['last_updated'],
+                        'read_count': int(obj['read_count']) if obj['read_count'].isdigit() else 0
+                    }
+                }
+            
+            _log.info(f"Loaded {len(results)} cached objects for device {device_address}, page {page}")
+            
+            return {
+                "status": "done",
+                "results": results,
+                "pagination": {
+                    "page": page,
+                    "page_size": page_size,
+                    "total_items": total_cached_objects,
+                    "total_pages": total_cached_pages,
+                    "has_next": page < total_cached_pages,
+                    "has_previous": page > 1
+                },
+                "_from_cache": True
+            }
+            
+        except Exception as e:
+            _log.error(f"Error loading cached object properties: {e}")
+            return None
+
+    async def read_object_list_names_paginated(self, device_address: str, device_object_identifier: str, page: int = 1, page_size: int = 100, force_fresh_read: bool = False) -> dict:
         """
-        Reads the object-list from a device (with caching), then reads object-name, units, and present-value for a specific page of objects.
-        Returns a paginated response with results and pagination metadata.
+        Reads object properties with CSV caching support.
         
-        The results dict will contain object identifiers as keys, with each value being a dict containing:
-        - 'object-name': The name of the object
-        - 'units': The units property of the object (if available)
-        - 'present-value': The current value of the object (if available)
+        Parameters:
+            force_fresh_read: If True, skip cache and read fresh from device
         """
-        _log.info(f"Starting read_object_list_names_paginated for device {device_address}, page {page}, page_size {page_size}")
+        _log.info(f"Starting read_object_list_names_paginated for device {device_address}, page {page}, page_size {page_size}, force_fresh_read={force_fresh_read}")
         
         # Validate pagination parameters
         if page < 1:
-            return {"error": "Page number must be >= 1"}
+            return {"status": "error", "error": "Page number must be >= 1"}
         if page_size < 1 or page_size > 1000:
-            return {"error": "Page size must be between 1 and 1000"}
+            return {"status": "error", "error": "Page size must be between 1 and 1000"}
+        
+        # Check cache first (unless force_fresh_read is True)
+        if not force_fresh_read:
+            cached_result = self.load_cached_object_properties(device_address, device_object_identifier, page, page_size)
+            if cached_result:
+                _log.info(f"Returning cached object properties for device {device_address}, page {page}")
+                return cached_result
+        
+        # Cache miss or forced fresh read - get from device
+        _log.info(f"Cache miss or fresh read forced - reading from device {device_address}")
         
         # Step 1: Get object-list from cache or read from device
         object_list = await self._get_cached_object_list(device_address, device_object_identifier)
         
         if object_list is None:
-            return {"error": "Failed to read object-list from device"}
+            return {"status": "error", "error": "Failed to read object-list from device"}
         
         total_objects = len(object_list)
         total_pages = (total_objects + page_size - 1) // page_size
@@ -878,33 +1042,41 @@ class BACnetProxy(AsyncioProtocolProxy):
         page_objects = object_list[start_idx:end_idx]
         
         if not page_objects:
-            return {"error": "No objects found for this page"}
+            return {"status": "error", "error": "No objects found for this page"}
         
         # Step 2: Prepare batch read for object-name, units, and present-value of each object
         daopr_list = []
         
         for objid in page_objects:
-            # Read object-name
+            # Always read object-name for all objects
             daopr_list.append(DeviceAddressObjectPropertyReference(
                 key=f"{objid}:object-name",
                 device_address=device_address,
                 object_identifier=objid,
                 property_reference=PropertyReference("object-name")
             ))
-            # Read units (if applicable)
-            daopr_list.append(DeviceAddressObjectPropertyReference(
-                key=f"{objid}:units",
-                device_address=device_address,
-                object_identifier=objid,
-                property_reference=PropertyReference("units")
-            ))
-            # Read present-value (if applicable)
-            daopr_list.append(DeviceAddressObjectPropertyReference(
-                key=f"{objid}:present-value",
-                device_address=device_address,
-                object_identifier=objid,
-                property_reference=PropertyReference("present-value")
-            ))
+            
+            # Only read units and present-value for objects that typically have them
+            obj_type = str(objid).split(',')[0] if ',' in str(objid) else str(objid)
+            
+            # Skip units and present-value for object types that don't typically have them
+            skip_types = ['device', 'program', 'schedule', 'trend-log', 'file', 'group', 'notification-class']
+            
+            if obj_type not in skip_types:
+                # Read units (if applicable)
+                daopr_list.append(DeviceAddressObjectPropertyReference(
+                    key=f"{objid}:units",
+                    device_address=device_address,
+                    object_identifier=objid,
+                    property_reference=PropertyReference("units")
+                ))
+                # Read present-value (if applicable)  
+                daopr_list.append(DeviceAddressObjectPropertyReference(
+                    key=f"{objid}:present-value",
+                    device_address=device_address,
+                    object_identifier=objid,
+                    property_reference=PropertyReference("present-value")
+                ))
         
         _log.info(f"Prepared batch read for {len(daopr_list)} objects on page {page}")
         
@@ -926,15 +1098,25 @@ class BACnetProxy(AsyncioProtocolProxy):
             
             # Process raw results to organize by object identifier
             results = {}
+            objects_to_cache = {}
+            
             for key, value in raw_results.items():
                 if ':' in key:
                     obj_id, property_name = key.rsplit(':', 1)
                     if obj_id not in results:
                         results[obj_id] = {}
+                    if obj_id not in objects_to_cache:
+                        objects_to_cache[obj_id] = {}
+                    
                     results[obj_id][property_name] = value
+                    objects_to_cache[obj_id][property_name] = value
                 else:
                     # Fallback for any keys without property suffix
                     results[key] = value
+            
+            # Save to cache
+            for obj_id, properties in objects_to_cache.items():
+                self.save_object_properties(device_address, device_object_identifier, obj_id, properties)
             
         except asyncio.TimeoutError:
             logging.getLogger(__name__).error(f"BatchRead timed out after 90 seconds for page {page}!")
@@ -954,7 +1136,8 @@ class BACnetProxy(AsyncioProtocolProxy):
                 "total_pages": total_pages,
                 "has_next": page < total_pages,
                 "has_previous": page > 1
-            }
+            },
+            "_from_cache": False
         }
 
     async def who_is(self, device_instance_low: int, device_instance_high: int, dest: str):
