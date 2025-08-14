@@ -28,7 +28,7 @@ from protocol_proxy.ipc import callback
 from protocol_proxy.proxy import launch
 from protocol_proxy.proxy.asyncio import AsyncioProtocolProxy
 
-logging.basicConfig(filename='/home/riley/VOLTTRON/volttron_bacnet_stuff/1_scan_tool/bacnet_proxy.log', level=logging.DEBUG,
+logging.basicConfig(filename='/tmp/bacnet_proxy.log', level=logging.DEBUG,
                     format='%(asctime)s - %(message)s')
 _log = logging.getLogger(__name__)
 
