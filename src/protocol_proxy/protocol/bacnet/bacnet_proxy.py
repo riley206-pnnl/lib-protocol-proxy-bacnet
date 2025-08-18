@@ -24,6 +24,7 @@ import traceback
 
 from bacpypes3.app import Application
 from bacpypes3.basetypes import DateTime, PropertyReference
+from bacpypes3.primitivedata import ObjectType
 from bacpypes3.constructeddata import AnyAtomic
 from bacpypes3.lib.batchread import BatchRead, DeviceAddressObjectPropertyReference
 from bacpypes3.pdu import Address, PDUData
@@ -1239,9 +1240,25 @@ class BACnetProxy(AsyncioProtocolProxy):
             devices_found = []
             if i_am_responses:
                 for i_am_pdu in i_am_responses:
+                    # Convert deviceIdentifier to consistent string format
+                    device_identifier = i_am_pdu.iAmDeviceIdentifier
+                    
+                    # Handle both numeric [8, 506892] and string ['device', 506892] formats
+                    if isinstance(device_identifier, (list, tuple)) and len(device_identifier) == 2:
+                        obj_type, instance = device_identifier
+                        if isinstance(obj_type, int):
+                            # Convert numeric object type to string using ObjectType enum
+                            try:
+                                obj_type_name = ObjectType(obj_type).name
+                                device_identifier = [obj_type_name, instance]
+                            except (ValueError, AttributeError):
+                                # If conversion fails, use string representation
+                                device_identifier = [str(obj_type), instance]
+                        # If already string format, keep as is
+                    
                     device_info = {
                         "pduSource": str(i_am_pdu.pduSource),
-                        "deviceIdentifier": i_am_pdu.iAmDeviceIdentifier,
+                        "deviceIdentifier": device_identifier,
                         "maxAPDULengthAccepted": i_am_pdu.maxAPDULengthAccepted,
                         "segmentationSupported": str(i_am_pdu.segmentationSupported),
                         "vendorID": i_am_pdu.vendorID,
