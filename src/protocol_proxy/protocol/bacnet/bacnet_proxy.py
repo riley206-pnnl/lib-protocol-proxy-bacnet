@@ -13,6 +13,14 @@ from argparse import ArgumentParser
 from datetime import datetime
 from math import floor
 from typing import Optional, Type
+import asyncio
+import csv
+import ipaddress
+import json
+import logging
+import sys
+import time
+import traceback
 
 from bacpypes3.app import Application
 from bacpypes3.basetypes import DateTime, PropertyReference
@@ -60,6 +68,7 @@ class BACnetProxy(AsyncioProtocolProxy):
         self.register_callback(self.read_object_list_names_endpoint, 'READ_OBJECT_LIST', provides_response=True, timeout=300)
         self.register_callback(self.clear_cache_endpoint, 'CLEAR_CACHE', provides_response=True)
         self.register_callback(self.get_cache_stats_endpoint, 'GET_CACHE_STATS', provides_response=True)
+        self.register_callback(self.get_cached_devices_endpoint, 'GET_CACHED_DEVICES', provides_response=True)
 
     def _handle_bacnet_response(self, result):
         """Helper method to handle BACnet responses and convert errors to JSON-serializable format."""
@@ -165,6 +174,7 @@ class BACnetProxy(AsyncioProtocolProxy):
         Args:
             network_str: Optional network filter (e.g., "192.168.1.0/24")
                         If provided, only returns devices found on that network
+                        If None, returns ALL cached devices globally (for comprehensive discovery)
                         
         Returns:
             list: Devices in same format as scan_subnet returns
@@ -185,8 +195,6 @@ class BACnetProxy(AsyncioProtocolProxy):
                     # Filter by network if specified
                     if network_str:
                         networks = row.get('networks_found_on', '').split(';') if row.get('networks_found_on') else []
-                        if network_str not in networks:
-                            continuenetworks = row.get('networks_found_on', '').split(';') if row.get('networks_found_on') else []
                         if network_str not in networks:
                             continue
                     
@@ -386,10 +394,9 @@ class BACnetProxy(AsyncioProtocolProxy):
                "high_id": 4194303,
                "enable_brute_force": true,
                "semaphore_limit": 20,
-               "max_duration": 280.0,
-               "force_fresh_scan": false
+               "max_duration": 280.0
              }
-           Backward compatible: old payload with only network still works.
+           Note: Removed force_fresh_scan - scan is always real but cache-informed.
         """
         try:
             message = json.loads(raw_message.decode('utf8'))
@@ -401,7 +408,8 @@ class BACnetProxy(AsyncioProtocolProxy):
             enable_brute_force = bool(message.get('enable_brute_force', True))
             semaphore_limit = int(message.get('semaphore_limit', 20))
             max_duration = float(message.get('max_duration', 280.0))
-            force_fresh_scan = bool(message.get('force_fresh_scan', False))
+            
+            # Removed force_fresh_scan parameter
             result = await self.scan_subnet(
                 network_str,
                 whois_timeout=whois_timeout,
@@ -410,8 +418,7 @@ class BACnetProxy(AsyncioProtocolProxy):
                 high_id=high_id,
                 enable_brute_force=enable_brute_force,
                 semaphore_limit=semaphore_limit,
-                max_duration=max_duration,
-                force_fresh_scan=force_fresh_scan
+                max_duration=max_duration
             )
             return json.dumps(result).encode('utf8')
         except Exception as e:
@@ -561,6 +568,19 @@ class BACnetProxy(AsyncioProtocolProxy):
         result = self._get_cache_stats()
         return json.dumps(result).encode('utf8')
 
+    @callback
+    async def get_cached_devices_endpoint(self, _, raw_message: bytes):
+        """New endpoint specifically for retrieving cached devices without scanning."""
+        try:
+            message = json.loads(raw_message.decode('utf8'))
+            network_str = message.get('network', None)  # Optional network filter
+            
+            cached_devices = self.load_cached_devices(network_str)
+            return json.dumps(cached_devices).encode('utf8')
+        except Exception as e:
+            _log.error(f"get_cached_devices_endpoint error: {e}")
+            return json.dumps({"error": str(e)}).encode('utf8')
+
     @classmethod
     def get_unique_remote_id(cls, unique_remote_id: tuple) -> tuple:
         """Get a unique identifier for the proxy server
@@ -578,17 +598,20 @@ class BACnetProxy(AsyncioProtocolProxy):
         high_id: int = 4194303,
         enable_brute_force: bool = True,
         semaphore_limit: int = 20,
-        max_duration: float = 280.0,
-        force_fresh_scan: bool = False
+        max_duration: float = 280.0
     ) -> list:
         """
-        Hybrid subnet scan:
-          1. Check cache first (unless force_fresh_scan=True)
+        Smart subnet scan with global cache-informed scanning:
+          1. First scan ALL cached device addresses globally (comprehensive discovery)
           2. Directed broadcast Who-Is (subnet broadcast)
           3. Limited broadcast Who-Is (255.255.255.255)
-          4. Brute force unicast sweep (only if no devices found from broadcasts)
+          4. Brute force unicast sweep of remaining addresses (if enabled and needed)
 
-        Parameters (all have defaults to preserve old behavior):
+        Note: Step 1 now scans ALL cached devices from ANY network to build comprehensive
+        network topology knowledge over time. Devices found on 130.20.24.0/24 will be
+        checked when scanning 10.71.19.0/24, enabling cross-network discovery.
+
+        Parameters (removed force_fresh_scan as scan is always real):
           network_str        CIDR (e.g. 192.168.1.0/24)
           whois_timeout      Seconds to wait per broadcast (wait_for timeout)
           port               UDP BACnet port to target (default 47808)
@@ -596,18 +619,10 @@ class BACnetProxy(AsyncioProtocolProxy):
           enable_brute_force Whether to fall back to per-host unicast if broadcasts find nothing
           semaphore_limit    Concurrency for brute force sweep (default 20)
           max_duration       Safety cap (seconds) for brute force phase (default 280)
-          force_fresh_scan   If True, skip cache and force fresh network scan (default False)
         Returns: list[device_dict]
         """
 
         start_time = time.time()
-
-        # Handle cache logic - check cache unless force_fresh_scan is True
-        if not force_fresh_scan:
-            cached_devices = self.load_cached_devices(network_str)
-            if cached_devices:
-                _log.info(f"[scan_subnet] Returning {len(cached_devices)} cached devices for {network_str}")
-                return cached_devices
 
         try:
             net = ipaddress.IPv4Network(network_str, strict=False)
@@ -617,6 +632,7 @@ class BACnetProxy(AsyncioProtocolProxy):
 
         discovered: list[dict] = []
         seen_keys: set = set()
+        scanned_ips: set = set()  # Track which IPs we've already scanned
 
         def add_devices(devs: list[dict] | None):
             if not devs:
@@ -626,8 +642,61 @@ class BACnetProxy(AsyncioProtocolProxy):
                 if key not in seen_keys:
                     discovered.append(d)
                     seen_keys.add(key)
+                    # Track the IP as scanned
+                    pdu_source = d.get('pduSource', '')
+                    if ':' in pdu_source:
+                        ip_str = pdu_source.split(':')[0]
+                        try:
+                            ip_obj = ipaddress.IPv4Address(ip_str)
+                            if ip_obj in net:
+                                scanned_ips.add(ip_obj)
+                        except ValueError:
+                            pass
 
-        # 1. Directed broadcast
+        # 1. Global cache-informed scanning - scan ALL known device IPs first (from any network)
+        cached_devices = self.load_cached_devices(None)  # Get ALL cached devices globally
+        if cached_devices:
+            _log.info(f"[scan_subnet] Found {len(cached_devices)} global cached devices, scanning them first for comprehensive discovery")
+            
+            # Extract unique IP addresses from ALL cached devices (global discovery approach)
+            cached_ips = set()
+            for device in cached_devices:
+                pdu_source = device.get('pduSource', '')
+                if ':' in pdu_source:
+                    ip_str = pdu_source.split(':')[0]
+                    try:
+                        ip_obj = ipaddress.IPv4Address(ip_str)
+                        # Include ALL cached IPs regardless of network for global discovery
+                        cached_ips.add(ip_obj)
+                    except ValueError:
+                        continue
+            
+            # Scan cached IPs with higher concurrency since they're likely to respond
+            if cached_ips:
+                _log.debug(f"[scan_subnet] Scanning {len(cached_ips)} global cached device IPs for comprehensive discovery")
+                sem_cached = asyncio.Semaphore(min(len(cached_ips), 50))  # Higher concurrency for cached
+                
+                async def probe_cached(ip_obj):
+                    async with sem_cached:
+                        dest = f"{ip_obj}:{port}"
+                        try:
+                            resp = await asyncio.wait_for(
+                                self.who_is(low_id, high_id, dest), 
+                                timeout=whois_timeout
+                            )
+                            if resp:
+                                _log.debug(f"[scan_subnet] Cached device verified at {dest}")
+                                add_devices(resp)
+                        except Exception:
+                            pass  # Cache miss is fine, device may have moved
+                
+                cached_tasks = [asyncio.create_task(probe_cached(ip)) for ip in cached_ips]
+                if cached_tasks:
+                    await asyncio.gather(*cached_tasks, return_exceptions=True)
+                
+                _log.info(f"[scan_subnet] Global cached scan complete: {len(discovered)} devices verified from comprehensive discovery")
+
+        # 2. Directed broadcast
         directed_broadcast = f"{net.broadcast_address}:{port}"
         _log.debug(f"[scan_subnet] Directed broadcast Who-Is -> {directed_broadcast}")
         try:
@@ -638,8 +707,8 @@ class BACnetProxy(AsyncioProtocolProxy):
         except Exception as e:
             _log.debug(f"[scan_subnet] Directed broadcast error: {e}")
 
-        # 2. Limited broadcast if none found yet
-        if not discovered:
+        # 3. Limited broadcast if we haven't found many devices yet
+        if len(discovered) < 5:  # Arbitrary threshold - adjust as needed
             limited_broadcast = f"255.255.255.255:{port}"
             _log.debug(f"[scan_subnet] Limited broadcast Who-Is -> {limited_broadcast}")
             try:
@@ -650,38 +719,44 @@ class BACnetProxy(AsyncioProtocolProxy):
             except Exception as e:
                 _log.debug(f"[scan_subnet] Limited broadcast error: {e}")
 
-        # 3. Brute force unicast sweep (only if still nothing)
-        if not discovered and enable_brute_force:
-            host_count = sum(1 for _ in net.hosts())
-            if host_count > 1024:
-                _log.warning(f"[scan_subnet] Large network sweep: {host_count} hosts")
+        # 4. Brute force unicast sweep of remaining addresses (skip already scanned IPs)
+        if enable_brute_force:
+            remaining_hosts = [ip for ip in net.hosts() if ip not in scanned_ips]
+            host_count = len(remaining_hosts)
+            
+            if host_count > 0:
+                if host_count > 1024:
+                    _log.warning(f"[scan_subnet] Large network sweep: {host_count} remaining hosts")
 
-            _log.debug(f"[scan_subnet] Starting unicast sweep over {network_str} port={port} concurrency={semaphore_limit}")
-            sem = asyncio.Semaphore(semaphore_limit)
+                _log.debug(f"[scan_subnet] Starting unicast sweep over {host_count} remaining hosts, port={port}, concurrency={semaphore_limit}")
+                sem = asyncio.Semaphore(semaphore_limit)
 
-            async def probe(ip_obj):
-                async with sem:
+                async def probe(ip_obj):
+                    async with sem:
+                        if time.time() - start_time > max_duration:
+                            return
+                        dest = f"{ip_obj}:{port}"
+                        try:
+                            resp = await self.who_is(low_id, high_id, dest)
+                            if resp:
+                                _log.debug(f"[scan_subnet] Unicast hit {dest} -> {len(resp)} device(s)")
+                                add_devices(resp)
+                        except Exception:
+                            pass  # per-host errors are non-fatal
+
+                tasks = []
+                for host_ip in remaining_hosts:
                     if time.time() - start_time > max_duration:
-                        return
-                    dest = f"{ip_obj}:{port}"
-                    try:
-                        resp = await self.who_is(low_id, high_id, dest)
-                        if resp:
-                            _log.debug(f"[scan_subnet] Unicast hit {dest} -> {len(resp)} device(s)")
-                            add_devices(resp)
-                    except Exception:
-                        pass  # per-host errors are non-fatal
+                        _log.warning("[scan_subnet] Time limit reached; stopping sweep early")
+                        break
+                    tasks.append(asyncio.create_task(probe(host_ip)))
 
-            tasks = []
-            for host_ip in net.hosts():
-                if time.time() - start_time > max_duration:
-                    _log.warning("[scan_subnet] Time limit reached; stopping sweep early")
-                    break
-                tasks.append(asyncio.create_task(probe(host_ip)))
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+            else:
+                _log.debug("[scan_subnet] No remaining hosts to scan after cache verification")
 
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-
+        # Save all discovered devices to cache
         for device in discovered:
             self.save_discovered_device(device, network_str, "scan")
 
