@@ -816,6 +816,7 @@ class BACnet:
         limits: t.Tuple[int, int] = (0, 4194303),
         global_broadcast: bool = False,
         reset: bool = False,
+        unicast_targets: t.Optional[t.List[str]] = None,  # NEW
     ) -> None:
         """
         Initiates the discovery process to locate BACnet devices on the network asynchronously, then calls on discovery.
@@ -826,7 +827,13 @@ class BACnet:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
         asyncio.create_task(
-            self._discover(networks=networks, limits=limits, global_broadcast=global_broadcast, reset=reset)
+            self._discover(
+                networks=networks,
+                limits=limits,
+                global_broadcast=global_broadcast,
+                reset=reset,
+                unicast_targets=unicast_targets
+            )
         )
 
     async def _discover(
@@ -835,8 +842,8 @@ class BACnet:
         limits: t.Tuple[int, int],
         global_broadcast: bool,
         reset: bool,
-        #  the unit is in seconds 
         timeout: int = 30,
+        unicast_targets: t.Optional[t.List[str]] = None,  # NEW
     ) -> None:
         """
         Internal method to handle discovery logic.
@@ -875,6 +882,22 @@ class BACnet:
                 timeout=timeout,
             )
             found.extend((resp, None) for resp in responses)
+
+        # Perform unicast discovery
+        if unicast_targets:
+            print(f"Performing unicast discovery for {unicast_targets}")
+            for target in unicast_targets:
+                try:
+                    address = Address(target)
+                    responses = await self.app.who_is(
+                        low_limit=deviceInstanceRangeLowLimit,
+                        high_limit=deviceInstanceRangeHighLimit,
+                        address=address,
+                        timeout=timeout,
+                    )
+                    found.extend((resp, None) for resp in responses)
+                except Exception as e:
+                    _log.error(f"Unicast discovery failed for {target}: {e}")
 
         # Process I-Am responses
         self._process_iam_responses(found)
