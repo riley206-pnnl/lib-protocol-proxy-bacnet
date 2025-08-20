@@ -5,12 +5,15 @@ import logging
 import sys
 import time
 import traceback
+import typing as t
+import logging
 
 from argparse import ArgumentParser
 from datetime import datetime
 from math import floor
 from typing import Optional, Type
 
+from bacpypes3.pdu import Address, LocalBroadcast
 from bacpypes3.app import Application
 from bacpypes3.basetypes import DateTime, PropertyReference
 from bacpypes3.constructeddata import AnyAtomic
@@ -94,8 +97,8 @@ class BACnetProxy(AsyncioProtocolProxy):
         address = Address(message['address'])
         vendor_id = message['vendor_id']
         service_number = message['service_number']
-        # TODO: from_json may be an AI hallucination. Need to check this.
-        service_parameters = TagList.from_json(message.get('service_parameters', []))
+        # TODO: from_json may be an AI hallucination. Need to check this. chagne to fix error 
+        service_parameters = TagList(message.get('service_parameters', []))
         result = await self.bacnet.confirmed_private_transfer(address, vendor_id, service_number, service_parameters)
         return json.dumps(result).encode('utf8')
 
@@ -782,6 +785,10 @@ class BACnet:
     def __init__(self, local_device_address, bacnet_network=0, vendor_id=999, object_name='VOLTTRON BACnet Proxy',
                  device_info_cache=None, router_info_cache=None, ase_id=None, **_):
         _log.debug('WELCOME BAC')
+        # come back here after i finish debugging
+        self.learned_networks = set()  # Track discovered BACnet networks
+        self.router_responses = []
+        self.discovered_devices = {}
         vendor_info = get_vendor_info(vendor_id)
         device_object_class = vendor_info.get_object_class(ObjectType.device)
         device_object = device_object_class(objectIdentifier=('device', vendor_id), objectName=object_name)
@@ -797,6 +804,204 @@ class BACnet:
             aseID=ase_id
         )
         _log.debug(f'WE HAVE AN APP: {self.app.device_info_cache}')
+    # NPDU handler registration not needed in BACpypes3; handled via async indication in Application subclass
+
+
+    # temp comment for organization to keep  work space clean for now 
+
+
+    def discover(
+        self,
+        networks: t.Union[str, t.List[int], int] = "known",
+        limits: t.Tuple[int, int] = (0, 4194303),
+        global_broadcast: bool = False,
+        reset: bool = False,
+    ) -> None:
+        """
+        Initiates the discovery process to locate BACnet devices on the network asynchronously, then calls on discovery.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        asyncio.create_task(
+            self._discover(networks=networks, limits=limits, global_broadcast=global_broadcast, reset=reset)
+        )
+
+    async def _discover(
+        self,
+        networks: t.Union[str, t.List[int], int],
+        limits: t.Tuple[int, int],
+        global_broadcast: bool,
+        reset: bool,
+        #  the unit is in seconds 
+        timeout: int = 30,
+    ) -> None:
+        """
+        Internal method to handle discovery logic.
+
+        Updates the `discovered_devices` attribute.
+        """
+        _log.debug(f"Starting discovery with parameters: {locals()}")
+        if reset:
+            self.discovered_devices = {}
+
+        # Collect networks
+        network_set = await self.collect_networks(networks, global_broadcast)
+
+        # Define device instance range
+        deviceInstanceRangeLowLimit, deviceInstanceRangeHighLimit = limits
+
+        # Query known networks and handle global broadcast
+        found = []
+        if network_set and not global_broadcast:
+            for net in network_set:
+                print(f"Discovering network {net}")
+                responses = await self.app.who_is(
+                    low_limit=deviceInstanceRangeLowLimit,
+                    high_limit=deviceInstanceRangeHighLimit,
+                    address=Address(f"{net}:*"),
+                    timeout=timeout,
+                )
+                found.extend((resp, net) for resp in responses)
+        else:
+            print(f"{'Global broadcast required' if global_broadcast else 'No networks found'}. Sending Who-Is with limits {limits}.")
+            address = None if global_broadcast else LocalBroadcast()
+            responses = await self.app.who_is(
+                low_limit=deviceInstanceRangeLowLimit,
+                high_limit=deviceInstanceRangeHighLimit,
+                address=address,
+                timeout=timeout,
+            )
+            found.extend((resp, None) for resp in responses)
+
+        # Process I-Am responses
+        self._process_iam_responses(found)
+
+
+
+    async def collect_networks( self, networks: t.Union[str, t.List[int], int], global_broadcast: bool = False,) -> t.Set[int]:
+        """
+        Collects BACnet network numbers to discover devices from.
+
+        Parameters:
+        - networks: A list or single network number. If "known", uses `learned_networks`.
+        - global_broadcast: Indicates whether routers should be discovered globally.
+
+        Returns:
+        - A set of network numbers to query.
+        """
+        network_set = self.learned_networks.copy()
+
+        # Add the local network number if available
+        local_network = await self.what_is_network_number()
+        if local_network:
+            network_set.add(local_network)
+
+        # Discover routers to networks
+        routers = await self.whois_router_to_network()
+        if not routers:
+            routers = await self.whois_router_to_network(global_broadcast=True)
+
+        for _, response in routers:
+            network_set.update(response.iartnNetworkList)
+
+        # Expand network set based on user-specified networks
+        if isinstance(networks, list):
+            network_set.update(int(n) for n in networks if n < 65535)
+        elif isinstance(networks, int) and networks < 65535:
+            network_set.add(networks)
+        elif networks == "known":
+            pass  # Keep the current learned networks
+
+        return network_set
+
+    def _process_iam_responses(self, responses: t.List[t.Tuple[object, t.Optional[int]]]) -> None:
+        """
+        Processes I-Am responses from BACnet devices and updates `discovered_devices`.
+
+        Parameters:
+        - responses: List of tuples containing the I-Am response and network number.
+        """
+        for iam_request, network_number in responses:
+            # Handle both dict and object types for device info
+            if isinstance(iam_request, dict):
+                objid = iam_request.get("deviceIdentifier")
+                device_address = iam_request.get("pduSource")
+                vendor_id = iam_request.get("vendorID")
+            else:
+                objid = getattr(iam_request, "iAmDeviceIdentifier", None)
+                device_address = getattr(iam_request, "pduSource", None)
+                vendor_id = getattr(iam_request, "vendorID", None)
+            key = str(objid)
+            if key not in self.discovered_devices:
+                self.discovered_devices[key] = {
+                    "object_instance": objid,
+                    "address": device_address,
+                    "network_number": {network_number} if network_number is not None else set(),
+                    "vendor_id": vendor_id,
+                    "vendor_name": "unknown",
+                }
+            else:
+                self.discovered_devices[key]["network_number"].add(network_number)
+
+
+            
+    async def what_is_network_number(self) -> t.Optional[int]:
+        """
+        Returns the local BACnet network number by querying the network port object.
+        """
+        try:
+            # Try to read the network number property from the local network port object
+            result = await self.read_property(
+                device_address="local",
+                object_identifier="network-port:0",
+                property_identifier="network-number"
+            )
+            if isinstance(result, int):
+                return result
+            # Only call get_value if not an error type
+            if hasattr(result, 'get_value') and not isinstance(result, ErrorRejectAbortNack):
+                return result.get_value()
+        except Exception as e:
+            _log.error(f"Error getting local network number: {e}")
+        return None
+
+    async def whois_router_to_network(self, global_broadcast: bool = False) -> list:
+        """
+        Discovers routers to other BACnet networks using Who-Is-Router-To-Network service.
+        Returns a list of tuples (source, response) for each discovered router.
+        """
+        try:
+            self.router_responses = []
+            # Build and send Who-IsRouterToNetwork NPDU
+            from bacpypes3.npdu import WhoIsRouterToNetwork
+            from bacpypes3.pdu import Address, GlobalBroadcast
+            npdu = WhoIsRouterToNetwork()
+            destination = GlobalBroadcast() if global_broadcast else Address("255.255.255.255")
+            npdu.pduDestination = destination
+            await self.app.indication(npdu)
+            # Wait for responses (simple sleep, could be improved with event/queue)
+            await asyncio.sleep(3)
+            return self.router_responses
+        except Exception as e:
+            _log.error(f"Error during router discovery: {e}")
+            return []
+
+    def indication(self, pdu):
+        # NPDU handler for router discovery
+        from bacpypes3.npdu import IAmRouterToNetwork
+        if isinstance(pdu, IAmRouterToNetwork):
+            self.router_responses.append((getattr(pdu, "pduSource", None), pdu))
+  
+
+
+
+
+
+
+# end of work section
 
     async def query_device(self, address: str, property_name: str = 'object-identifier'):
         """Returns properties about the device at the given address.
