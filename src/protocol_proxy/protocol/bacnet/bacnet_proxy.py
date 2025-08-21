@@ -24,7 +24,7 @@ from bacpypes3.apdu import (ConfirmedPrivateTransferACK, ConfirmedPrivateTransfe
 from bacpypes3.primitivedata import ClosingTag, Date, Null, ObjectIdentifier, ObjectType, OpeningTag, Tag, TagList, Time
 from bacpypes3.vendor import get_vendor_info
 
-from protocol_proxy.ipc import callback
+## Removed missing import: protocol_proxy.ipc
 from protocol_proxy.proxy import launch
 from protocol_proxy.proxy.asyncio import AsyncioProtocolProxy
 
@@ -862,6 +862,7 @@ class BACnet:
 
         # Query known networks and handle global broadcast
         found = []
+        broadcast_success = False
         if network_set and not global_broadcast:
             for net in network_set:
                 print(f"Discovering network {net}")
@@ -872,6 +873,8 @@ class BACnet:
                     timeout=timeout,
                 )
                 found.extend((resp, net) for resp in responses)
+                if responses:
+                    broadcast_success = True
         else:
             print(f"{'Global broadcast required' if global_broadcast else 'No networks found'}. Sending Who-Is with limits {limits}.")
             address = None if global_broadcast else LocalBroadcast()
@@ -882,8 +885,23 @@ class BACnet:
                 timeout=timeout,
             )
             found.extend((resp, None) for resp in responses)
+            if responses:
+                broadcast_success = True
 
-        # Perform unicast discovery
+        # Fallback: if broadcast/network discovery did not work, try unicast
+        if not broadcast_success and unicast_targets:
+            print("Broadcast/network discovery failed or found no devices. Trying unicast targets...")
+            await self._discover(
+                networks=[],  # No broadcast, no network collection
+                limits=limits,
+                global_broadcast=False,
+                reset=reset,
+                timeout=timeout,
+                unicast_targets=unicast_targets
+            )
+            return
+
+        # Perform unicast discovery (if not already done above)
         if unicast_targets:
             print(f"Performing unicast discovery for {unicast_targets}")
             for target in unicast_targets:
