@@ -1,4 +1,7 @@
 import asyncio
+# --- Placeholder for callback decorator ---
+def callback(func):
+    return func
 import ipaddress
 import json
 import logging
@@ -807,6 +810,23 @@ class BACnet:
     # NPDU handler registration not needed in BACpypes3; handled via async indication in Application subclass
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     # temp comment for organization to keep  work space clean for now 
 
 
@@ -821,11 +841,15 @@ class BACnet:
         """
         Initiates the discovery process to locate BACnet devices on the network asynchronously, then calls on discovery.
         """
+        print("[discover] Called with networks={}, limits={}, global_broadcast={}, reset={}, unicast_targets={}".format(networks, limits, global_broadcast, reset, unicast_targets))
         try:
+            print("[discover] Getting asyncio loop...")
             loop = asyncio.get_running_loop()
         except RuntimeError:
+            print("[discover] No running loop, creating new event loop.")
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+        print("[discover] Scheduling _discover task...")
         asyncio.create_task(
             self._discover(
                 networks=networks,
@@ -850,47 +874,58 @@ class BACnet:
 
         Updates the `discovered_devices` attribute.
         """
+        print(f"[_discover] Starting with networks={networks}, limits={limits}, global_broadcast={global_broadcast}, reset={reset}, timeout={timeout}, unicast_targets={unicast_targets}")
         _log.debug(f"Starting discovery with parameters: {locals()}")
         if reset:
+            print("[_discover] Resetting discovered_devices.")
             self.discovered_devices = {}
 
         # Collect networks
+        print("[_discover] Collecting networks...")
         network_set = await self.collect_networks(networks, global_broadcast)
+        print(f"[_discover] Networks to scan: {network_set}")
 
         # Define device instance range
         deviceInstanceRangeLowLimit, deviceInstanceRangeHighLimit = limits
+        print(f"[_discover] Device instance range: {deviceInstanceRangeLowLimit} to {deviceInstanceRangeHighLimit}")
 
         # Query known networks and handle global broadcast
         found = []
         broadcast_success = False
         if network_set and not global_broadcast:
+            print(f"[_discover] Scanning each network in {network_set}")
             for net in network_set:
                 print(f"Discovering network {net}")
                 responses = await self.app.who_is(
                     low_limit=deviceInstanceRangeLowLimit,
                     high_limit=deviceInstanceRangeHighLimit,
                     address=Address(f"{net}:*"),
-                    timeout=timeout,
+                    timeout=timeout
                 )
+                print(f"[_discover] Who-Is responses for network {net}: {responses}")
                 found.extend((resp, net) for resp in responses)
                 if responses:
+                    print(f"[_discover] Found responses for network {net}")
                     broadcast_success = True
         else:
-            print(f"{'Global broadcast required' if global_broadcast else 'No networks found'}. Sending Who-Is with limits {limits}.")
+            print(f"[_discover] {'Global broadcast required' if global_broadcast else 'No networks found'}. Sending Who-Is with limits {limits}.")
             address = None if global_broadcast else LocalBroadcast()
             responses = await self.app.who_is(
                 low_limit=deviceInstanceRangeLowLimit,
                 high_limit=deviceInstanceRangeHighLimit,
                 address=address,
-                timeout=timeout,
+                timeout=timeout
             )
+            print(f"[_discover] Who-Is responses for broadcast: {responses}")
             found.extend((resp, None) for resp in responses)
             if responses:
+                print(f"[_discover] Found responses for broadcast/global.")
                 broadcast_success = True
 
         # Fallback: if broadcast/network discovery did not work, try unicast
         if not broadcast_success and unicast_targets:
-            print("Broadcast/network discovery failed or found no devices. Trying unicast targets...")
+            print("[_discover] Broadcast/network discovery failed or found no devices. Swapping to unicast discovery mode.")
+            print(f"[_discover] Unicast targets: {unicast_targets}")
             await self._discover(
                 networks=[],  # No broadcast, no network collection
                 limits=limits,
@@ -903,26 +938,30 @@ class BACnet:
 
         # Perform unicast discovery (if not already done above)
         if unicast_targets:
-            print(f"Performing unicast discovery for {unicast_targets}")
+            print(f"[_discover] Performing unicast discovery for {unicast_targets}")
             for target in unicast_targets:
+                responses = []
                 try:
                     address = Address(target)
                     responses = await self.app.who_is(
                         low_limit=deviceInstanceRangeLowLimit,
                         high_limit=deviceInstanceRangeHighLimit,
                         address=address,
-                        timeout=timeout,
+                        timeout=timeout
                     )
-                    found.extend((resp, None) for resp in responses)
+                    print(f"[_discover] Who-Is responses for unicast target {target}: {responses}")
                 except Exception as e:
+                    print(f"[_discover] Unicast discovery failed for {target}: {e}")
                     _log.error(f"Unicast discovery failed for {target}: {e}")
+                found.extend((resp, None) for resp in responses)
 
         # Process I-Am responses
+        print(f"[_discover] Processing I-Am responses: {found}")
         self._process_iam_responses(found)
 
 
 
-    async def collect_networks( self, networks: t.Union[str, t.List[int], int], global_broadcast: bool = False,) -> t.Set[int]:
+    async def collect_networks(self, networks: t.Union[str, t.List[int], int], global_broadcast: bool = False) -> t.Set[int]:
         """
         Collects BACnet network numbers to discover devices from.
 
@@ -1036,6 +1075,20 @@ class BACnet:
         if isinstance(pdu, IAmRouterToNetwork):
             self.router_responses.append((getattr(pdu, "pduSource", None), pdu))
   
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
