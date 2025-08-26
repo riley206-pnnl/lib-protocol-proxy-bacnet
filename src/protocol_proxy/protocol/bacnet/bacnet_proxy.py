@@ -1413,6 +1413,93 @@ def nmap_probe_common_router_points(max_workers=10):
     for subnet in active_subnets:
         print(f"  {subnet}")
     print(f"Total elapsed time: {total_elapsed:.2f} seconds")
+    return active_subnets  # <-- Add this line!
+def nmap_probe_routed_networks(max_workers=10):
+    import subprocess
+    import re
+    import ipaddress
+    import nmap
+    import time
+    import concurrent.futures
+
+    def get_windows_routed_networks():
+        routed_networks = {}
+        try:
+            output = subprocess.check_output(["netstat.exe", "-r"], text=True)
+            for line in output.splitlines():
+                match = re.match(r"\s*(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\S+)\s+(\d+\.\d+\.\d+\.\d+)", line)
+                if match:
+                    dest, netmask, gateway, interface = match.groups()
+                    try:
+                        net = ipaddress.IPv4Network(f"{dest}/{netmask}", strict=False)
+                        # Only add valid, non-loopback, non-broadcast networks
+                        if not net.is_loopback and not net.is_multicast and not net.is_link_local and net.prefixlen >= 24:
+                            routed_networks[str(net)] = {
+                                "gateway": gateway,
+                                "interface": interface
+                            }
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"Error running netstat.exe -r: {e}")
+        return routed_networks
+
+    routed_networks = get_windows_routed_networks()
+    print(f"Windows routed networks found: {list(routed_networks.keys())}")
+
+    def probe_subnet(subnet):
+        scanner = nmap.PortScanner()
+        net_base = subnet.split('/')[0].rsplit('.', 1)[0] + '.'
+        probe_ips = [f"{net_base}1", f"{net_base}254"]
+        found = False
+        for ip in probe_ips:
+            try:
+                scanner.scan(hosts=ip, arguments='-sn --host-timeout 5s')
+                live_hosts = [host for host in scanner.all_hosts() if scanner[host].state() == 'up']
+                if live_hosts:
+                    found = True
+                    break
+            except Exception as e:
+                print(f"Error probing {ip}: {e}")
+        return subnet if found else None
+
+    active_networks = {}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(probe_subnet, subnet) for subnet in routed_networks]
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            if result:
+                print(f"Active network found: {result}")
+                active_networks[result] = routed_networks[result]
+
+    print(f"\nProbe complete. Active routed networks found ({len(active_networks)}):")
+    for subnet, info in active_networks.items():
+        print(f"  {subnet}: {info}")
+    return active_networks
+def get_windows_routed_networks():
+    import subprocess
+    import re
+    import ipaddress
+    routed_networks = {}
+    try:
+        output = subprocess.check_output(["netstat.exe", "-r"], text=True)
+        for line in output.splitlines():
+            # Look for lines like: "Network Destination        Netmask          Gateway       Interface  Metric"
+            match = re.match(r"^\s*(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)", line)
+            if match:
+                dest, netmask, gateway, interface = match.groups()
+                try:
+                    net = ipaddress.IPv4Network(f"{dest}/{netmask}", strict=False)
+                    routed_networks[str(net)] = {
+                        "gateway": gateway,
+                        "interface": interface
+                    }
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"Error running netstat.exe -r: {e}")
+    return routed_networks
 async def run_proxy(local_device_address, **kwargs):
     bp = BACnetProxy(local_device_address, **kwargs)
     # Removed call to bp.start(); not required or not implemented
@@ -1432,4 +1519,13 @@ def launch_bacnet(parser: ArgumentParser) -> tuple[ArgumentParser, Type[AsyncioP
 
 if __name__ == '__main__':
     sys.exit(launch(launch_bacnet))
+
+def run_router_probe():
+    print("Starting nmap probe of routed networks from Windows routing table...")
+    active_networks = nmap_probe_routed_networks()
+    print("\nActive routed networks dictionary:")
+    print(active_networks)
+
+if __name__ == "__main__":
+    run_router_probe()
 
