@@ -1350,145 +1350,69 @@ def scan_wifi_windows():
             networks.append({"ssid": current_ssid, "bssid": bssid})
     return networks
 
-    async def read_property(self, device_address: str, object_identifier: str, property_identifier: str,
-                           property_array_index: int | None = None):
-        from bacpypes3.pdu import Address
-        from bacpypes3.primitivedata import ObjectIdentifier
-        from bacpypes3.apdu import ErrorRejectAbortNack
-        _log.debug(f"BACnet.read_property called with device_address={device_address}, object_identifier={object_identifier}, property_identifier={property_identifier}, property_array_index={property_array_index}")
-        try:
-            response = await self.app.read_property(
-                Address(device_address),
-                ObjectIdentifier(object_identifier),
-                property_identifier,
-                int(property_array_index) if property_array_index is not None else None
-            )
-            _log.debug(f"BACnet.read_property response: {response}")
-        except ErrorRejectAbortNack as err:
-            _log.debug(f'Error reading property {err}')
-            response = err
-        if hasattr(response, 'get_value'):
-            response = response.get_value()
-        _log.debug(f"BACnet.read_property final response: {response}")
-        return response
+def nmap_probe_common_router_points(max_workers=10):
+    import nmap
+    import time
+    import concurrent.futures
 
-    async def read_property_multiple(self, device_address: str, read_specifications: list):
-        try:  # TODO: Do we need to fall back to read_property in loop? How to detect that? Should it be in driver instead?
-            _log.debug(f'Reading one or more properties at {device_address}: {read_specifications}')
-            # spec_list = []
-            # for (object_id, property_id, property_array_index) in read_specifications.values():
-            #     spec_list.extend([
-            #         ObjectIdentifier(object_id),
-            #         property_id])
-            #     if property_array_index is not None:
-            #         spec_list.append(int(property_array_index))
-            response = await self.app.read_property_multiple(
-                Address(device_address),
-                ['analogInput, 3000741',  # TODO: This is hard coded for testing. Make this a parsed input.
-                ['presentValue']]
-            )
-            _log.debug(f'Response is: {response}')
-        except ErrorRejectAbortNack as err:  # TODO: This does not seem to be catching abortPDU errors.
-            _log.debug(f'Error reading property {err}')
-            response = err
-        if isinstance(response, AnyAtomic):  # TODO: The response probably needs to be parsed. See example code.
-            response = response.get_value()
-            # _log.debug(f'Response from read_property_multiple: {response}')
-        return response
+    # Only probe the most common subnets
+    common_subnets = [
+        "192.168.0.0/24",
+        "192.168.1.0/24",
+        "10.0.0.0/24",
+        "10.1.1.0/24",
+        "172.16.0.0/24",
+        "172.16.1.0/24",
+    ]
 
-    async def write_property(self, device_address: str, object_identifier: str, property_identifier: str, value: any,
-                    priority: int, property_array_index: int | None = None):
-        value = Null(()) if value is None else value
-        # TODO: Is additional casting required?
-        try:
-            return await self.app.write_property(
-                Address(device_address),
-                ObjectIdentifier(object_identifier),
-                property_identifier,
-                value,
-                int(property_array_index) if property_array_index is not None else None,
-                int(priority)
-            )
-        except ErrorRejectAbortNack as e:
-            print(str(e))
+    def probe_subnet(subnet, last_time_holder):
+        scanner = nmap.PortScanner()
+        net_base = subnet[:-4]
+        probe_ips = [f"{net_base}1", f"{net_base}254"]
+        subnet_start = time.time()
+        found = False
+        for ip in probe_ips:
+            try:
+                scanner.scan(hosts=ip, arguments='-sn --host-timeout 5s')
+                live_hosts = [host for host in scanner.all_hosts() if scanner[host].state() == 'up']
+                if live_hosts:
+                    found = True
+                    break
+            except Exception as e:
+                print(f"Error probing {ip}: {e}")
+        subnet_end = time.time()
+        subnet_time = subnet_end - subnet_start
+        diff_since_last = subnet_start - last_time_holder[0]
+        last_time_holder[0] = subnet_end
+        return (subnet, found, subnet_time, diff_since_last)
 
-    async def write_property_multiple(self, device_address: str, write_specifications: list):
-        # TODO Implement write_property_multiple.
-        return []
+    start_time = time.time()
+    last_time_holder = [start_time]
 
-    async def time_synchronization(self, device_address: str, date_time: datetime = None):
-        date_time = date_time if date_time else datetime.now()
-        time_synchronization_request = TimeSynchronizationRequest(
-            destination=Address(device_address),
-            time=DateTime(date=Date(date_time.date()), time=Time(date_time.time()))
-        )
-        response = await self.app.request(time_synchronization_request)
-        if isinstance(response, ErrorRejectAbortNack):
-            _log.warning(f'Error calling Time Synchronization Service: {response}')
+    total_subnets = len(common_subnets)
+    print(f"Total common subnets to probe: {total_subnets}")
 
+    active_subnets = []
 
-    async def confirmed_private_transfer(self, address: Address, vendor_id: int, service_number: int,
-                                         service_parameters: TagList = None) -> any:
-        # TODO: Probably need one or more try blocks.
-        # TODO: service_parameters probably needs to already be formatted, but how?
-        cpt_request = ConfirmedPrivateTransferRequest(destination=address,
-                                                      vendorID=vendor_id,
-                                                      serviceNumber=service_number)
-        if service_parameters:
-            cpt_request.serviceParameters = service_parameters
-        response = await self.app.request(cpt_request)
-        if isinstance(response, ConfirmedPrivateTransferError):
-            _log.warning(f'Error calling Confirmed Private Transfer Service: {response}')
-        elif isinstance(response, ConfirmedPrivateTransferACK):
-            return response
-        else:
-            _log.warning(f'Some other Error: {response}')  # TODO: Improve error handling.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(probe_subnet, subnet, last_time_holder)
+            for subnet in common_subnets
+        ]
+        for idx, future in enumerate(concurrent.futures.as_completed(futures), start=1):
+            subnet, found, subnet_time, diff_since_last = future.result()
+            print(f"[{idx}/{total_subnets}] Subnet: {subnet}")
+            print(f"  Probe time: {subnet_time:.2f} seconds")
+            print(f"  Difference since last probe: {diff_since_last:.2f} seconds")
+            if found:
+                print(f"  Active network found!")
+                active_subnets.append(subnet)
 
-    async def send_object_user_lock_time(self, address: Address, device_id: str, object_id: str,
-                                         lock_interval: int):
-        if lock_interval < 0:
-            lock_interval_code = 0xFF
-            lock_interval = 0
-        elif lock_interval <= 60:
-            lock_interval_code = 0
-            lock_interval = floor(lock_interval)
-        elif lock_interval <= 3600:
-            lock_interval_code = 1
-            lock_interval = floor(lock_interval / 60)
-        elif lock_interval <= 86400:
-            lock_interval_code = 2
-            lock_interval = floor(lock_interval / 3600)
-        elif lock_interval <= 22032000:
-            lock_interval_code = 3
-            lock_interval = floor(lock_interval / 86400)
-        else:
-            lock_interval_code = 0xFF
-            lock_interval = 0
-        response = await self.confirmed_private_transfer(address=Address(address), vendor_id=213, service_number=28,
-                                                         service_parameters=TagList([
-                                                             OpeningTag(2),
-                                                             ObjectIdentifier(device_id, _context=0).encode(),
-                                                             ObjectIdentifier(object_id, _context=0).encode(),
-                                                             ObjectUserLockTime(lock_interval_code, lock_interval),
-                                                             ClosingTag(2)
-                                                            ])
-                                                         )
-        return response  # TODO: Improve error handling.
-
-
-class ObjectUserLockTime(Tag):
-    def __init__(self, interval_code, interval_value, *args):
-        super(ObjectUserLockTime, self).__init__(*args)
-        self.interval_code: int = interval_code
-        self.interval_value: int = interval_value
-
-    def encode(self) -> PDUData:
-        pdu_data = PDUData()
-        pdu_data.put(self.interval_code)
-        pdu_data.put(self.interval_value)
-        return pdu_data
-
-
+    total_elapsed = time.time() - start_time
+    print(f"\nProbe complete. Active networks found ({len(active_subnets)}):")
+    for subnet in active_subnets:
+        print(f"  {subnet}")
+    print(f"Total elapsed time: {total_elapsed:.2f} seconds")
 async def run_proxy(local_device_address, **kwargs):
     bp = BACnetProxy(local_device_address, **kwargs)
     # Removed call to bp.start(); not required or not implemented
