@@ -1,4 +1,6 @@
+# Standard library imports
 import asyncio
+import csv
 import ipaddress
 import json
 import logging
@@ -6,33 +8,42 @@ import re
 import sys
 import time
 import traceback
-import os
-import csv
-
 from argparse import ArgumentParser
 from datetime import datetime
 from math import floor
+from pathlib import Path
 from typing import Optional, Type
-import asyncio
-import csv
-import ipaddress
-import json
-import logging
-import sys
-import time
-import traceback
 
+# Third-party BACnet library imports
 from bacpypes3.app import Application
+from bacpypes3.apdu import (
+    AbortPDU, 
+    ConfirmedPrivateTransferACK, 
+    ConfirmedPrivateTransferError, 
+    ConfirmedPrivateTransferRequest,
+    ErrorPDU, 
+    ErrorRejectAbortNack, 
+    RejectPDU,
+    TimeSynchronizationRequest
+)
 from bacpypes3.basetypes import DateTime, PropertyReference
-from bacpypes3.primitivedata import ObjectType
 from bacpypes3.constructeddata import AnyAtomic
 from bacpypes3.lib.batchread import BatchRead, DeviceAddressObjectPropertyReference
 from bacpypes3.pdu import Address, PDUData
-from bacpypes3.apdu import (ConfirmedPrivateTransferACK, ConfirmedPrivateTransferError, ConfirmedPrivateTransferRequest,
-                            ErrorRejectAbortNack, TimeSynchronizationRequest, AbortPDU, ErrorPDU, RejectPDU)
-from bacpypes3.primitivedata import ClosingTag, Date, Null, ObjectIdentifier, ObjectType, OpeningTag, Tag, TagList, Time
+from bacpypes3.primitivedata import (
+    ClosingTag, 
+    Date, 
+    Null, 
+    ObjectIdentifier, 
+    ObjectType, 
+    OpeningTag, 
+    Tag, 
+    TagList, 
+    Time
+)
 from bacpypes3.vendor import get_vendor_info
 
+# Local protocol proxy imports
 from protocol_proxy.ipc import callback
 from protocol_proxy.proxy import launch
 from protocol_proxy.proxy.asyncio import AsyncioProtocolProxy
@@ -70,6 +81,72 @@ class BACnetProxy(AsyncioProtocolProxy):
         self.register_callback(self.clear_cache_endpoint, 'CLEAR_CACHE', provides_response=True)
         self.register_callback(self.get_cache_stats_endpoint, 'GET_CACHE_STATS', provides_response=True)
         self.register_callback(self.get_cached_devices_endpoint, 'GET_CACHED_DEVICES', provides_response=True)
+
+    def make_jsonable(self, val):
+        """Unified function to convert BACnet objects to JSON-serializable format."""
+        # Handle basic JSON-serializable types
+        if isinstance(val, (str, int, float, bool)):
+            return val
+        
+        if val is None:
+            return None
+        
+        # Handle collections
+        if isinstance(val, (list, tuple, set)):
+            return [self.make_jsonable(v) for v in val]
+        
+        if isinstance(val, dict):
+            return {str(k): self.make_jsonable(v) for k, v in val.items()}
+        
+        # Handle binary data
+        if isinstance(val, (bytes, bytearray)):
+            return val.hex()
+        
+        # Handle IP addresses
+        if hasattr(val, '__class__'):
+            class_name = val.__class__.__name__
+            if 'IPv4Address' in class_name or 'IPv6Address' in class_name:
+                return str(val)
+        
+        # Handle BACnet EngineeringUnits (both objects and integers)
+        if hasattr(val, '__class__') and 'EngineeringUnits' in str(val.__class__):
+            unit_str = str(val)
+            if unit_str.startswith('EngineeringUnits(') and unit_str.endswith(')'):
+                return unit_str[17:-1]  # Remove "EngineeringUnits(" and ")"
+            return unit_str
+        
+        # Handle Python enums
+        if hasattr(val, 'name') and hasattr(val, 'value'):
+            return str(val.name)
+        if hasattr(val, 'name') and not hasattr(val, 'value'):
+            return str(val.name)
+        
+        # Handle objects with as_tuple method (BACnet objects)
+        if hasattr(val, 'as_tuple'):
+            return str(val)
+        
+        # Handle error objects
+        if hasattr(val, '__class__') and 'Error' in val.__class__.__name__:
+            return None  # or str(val) if you want error details
+        
+        # Handle objects with __dict__ (convert to dict)
+        if hasattr(val, '__dict__') and not isinstance(val, type):
+            return {str(k): self.make_jsonable(v) for k, v in val.__dict__.items()}
+        
+        # Handle BACnet EngineeringUnits string representations
+        if hasattr(val, '__str__'):
+            val_str = str(val)
+            if 'ErrorType' in val_str or 'Error' in type(val).__name__:
+                return None
+            if 'EngineeringUnits:' in val_str or 'EngineeringUnits(' in val_str:
+                import re
+                match = re.search(r'EngineeringUnits(?:\(|:)\s*([^>)]+)', val_str)
+                if match:
+                    return match.group(1).strip()
+            return val_str
+        
+        # Final fallback
+        return str(val)
 
     def _handle_bacnet_response(self, result):
         """Helper method to handle BACnet responses and convert errors to JSON-serializable format."""
@@ -257,22 +334,9 @@ class BACnetProxy(AsyncioProtocolProxy):
         property_identifier = message['property_identifier']
         property_array_index = message.get('property_array_index', None)
         result = await self.bacnet.read_property(address, object_identifier, property_identifier, property_array_index)
-        def make_jsonable(val):
-            if isinstance(val, (list, tuple)):
-                return [make_jsonable(v) for v in val]
-            if isinstance(val, (bytes, bytearray)):
-                return val.hex()
-            if hasattr(val, 'as_tuple'):
-                return str(val)
-            if hasattr(val, '__dict__') and not isinstance(val, type):
-                return {k: make_jsonable(v) for k, v in val.__dict__.items()}
-            if hasattr(val, '__class__') and 'Error' in val.__class__.__name__:
-                return str(val)
-            import ipaddress
-            if isinstance(val, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
-                return str(val)
-            return val
-        jsonable_result = make_jsonable(result)
+
+        jsonable_result = self.make_jsonable(result)
+
         try:
             if isinstance(result, ErrorRejectAbortNack):
                 error_response = {
@@ -298,9 +362,11 @@ class BACnetProxy(AsyncioProtocolProxy):
         read_specifications = message['read_specifications']
         result = await self.bacnet.read_property_multiple(address, read_specifications)
         
-        # Handle BACnet responses (including errors)
+        # Handle BACnet responses (including errors) first
         handled_result = self._handle_bacnet_response(result)
-        return json.dumps(handled_result).encode('utf8')
+        # Then make it jsonable
+        jsonable_result = self.make_jsonable(handled_result)
+        return json.dumps(jsonable_result).encode('utf8')
 
     @callback
     async def send_object_user_lock_time_endpoint(self, _, raw_message: bytes):
@@ -334,7 +400,10 @@ class BACnetProxy(AsyncioProtocolProxy):
         property_array_index = message.get('property_array_index', None)
         result = await self.bacnet.write_property(address, object_identifier, property_identifier, value, priority,
                                             property_array_index)
-        return json.dumps(result).encode('utf8')
+        
+        # Use unified make_jsonable
+        jsonable_result = self.make_jsonable(result)
+        return json.dumps(jsonable_result).encode('utf8')
 
     @callback
     async def write_property_multiple_endpoint(self, _, raw_message: bytes):
@@ -342,8 +411,12 @@ class BACnetProxy(AsyncioProtocolProxy):
         message = json.loads(raw_message.decode('utf8'))
         address = message['device_address']
         write_specifications = message['write_specifications']
-        result = await self.bacnet.read_property(address, write_specifications)
-        return json.dumps(result).encode('utf8')
+        
+        result = await self.bacnet.write_property_multiple(address, write_specifications)
+        
+        # Use unified make_jsonable
+        jsonable_result = self.make_jsonable(result)
+        return json.dumps(jsonable_result).encode('utf8')
 
     @callback
     async def read_device_all_endpoint(self, _, raw_message: bytes):
@@ -355,18 +428,9 @@ class BACnetProxy(AsyncioProtocolProxy):
             result = await self.read_device_all(device_address, device_object_identifier)
             if not result:
                 return json.dumps({"error": "No data returned from read_device_all"}).encode('utf8')
-            def make_jsonable(val):
-                if isinstance(val, (str, int, float, bool)):
-                    return val
-                if isinstance(val, (list, tuple, set)):
-                    return [make_jsonable(v) for v in val]
-                if isinstance(val, (bytes, bytearray)):
-                    return val.hex()
-                if hasattr(val, '__dict__') and not isinstance(val, type):
-                    return {str(k): make_jsonable(v) for k, v in val.__dict__.items()}
-                # TODO: Replace this forced string conversion with proper BACnet object serialization
-                return f"FORCED:{str(val)}"
-            jsonable_result = {str(k): make_jsonable(v) for k, v in result.items()}
+
+            jsonable_result = self.make_jsonable(result)
+
             return json.dumps(jsonable_result).encode('utf8')
         except Exception as e:
             tb = traceback.format_exc()
@@ -435,7 +499,7 @@ class BACnetProxy(AsyncioProtocolProxy):
             device_object_identifier = message['device_object_identifier']
             page = message.get('page', 1)
             page_size = message.get('page_size', 100)
-            force_fresh_read = message.get('force_fresh_read', False)  # New parameter
+            force_fresh_read = message.get('force_fresh_read', False)
             
             logging.getLogger(__name__).info(f"read_object_list_names_endpoint called for device {device_address}, page {page}, page_size {page_size}, force_fresh_read={force_fresh_read}")
             
@@ -452,93 +516,34 @@ class BACnetProxy(AsyncioProtocolProxy):
                 logging.getLogger(__name__).error(f"Error in read_object_list_names_paginated: {result['error']}")
                 return json.dumps(result).encode('utf8')
             
-            def make_jsonable(val):
-                if isinstance(val, (str, int, float, bool)):
-                    # Special handling for integer units - convert to EngineeringUnits name
-                    if isinstance(val, int):
-                        # Check if this looks like a BACnet EngineeringUnits value
-                        try:
-                            from bacpypes3.basetypes import EngineeringUnits
-                            # Try to convert the integer to an EngineeringUnits enum
-                            engineering_unit = EngineeringUnits(val)
-                            unit_str = str(engineering_unit)
-                            # Handle BACnet EngineeringUnits string format
-                            if unit_str.startswith('EngineeringUnits(') and unit_str.endswith(')'):
-                                return unit_str[17:-1]  # Remove "EngineeringUnits(" and ")"
-                            else:
-                                return unit_str
-                        except (ImportError, ValueError, TypeError):
-                            # If conversion fails, return the original value
-                            pass
-                    return val
-                if val is None:
-                    return None
-                if isinstance(val, (list, tuple, set)):
-                    return [make_jsonable(v) for v in val]
-                if isinstance(val, dict):
-                    return {str(k): make_jsonable(v) for k, v in val.items()}
-                if isinstance(val, (bytes, bytearray)):
-                    return val.hex()
-                # Handle BACnet EngineeringUnits and other enum-like objects
-                if hasattr(val, '__class__') and 'EngineeringUnits' in str(val.__class__):
-                    # This is a BACnet EngineeringUnits object
-                    unit_str = str(val)
-                    if unit_str.startswith('EngineeringUnits(') and unit_str.endswith(')'):
-                        return unit_str[17:-1]  # Remove "EngineeringUnits(" and ")"
-                    else:
-                        return unit_str
-                if hasattr(val, 'name') and hasattr(val, 'value'):
-                    # This is likely a standard Python enum
-                    return str(val.name)
-                if hasattr(val, 'name') and not hasattr(val, 'value'):
-                    # Handle other enum-like objects that only have name
-                    return str(val.name)
-                if hasattr(val, '__str__'):
-                    val_str = str(val)
-                    # Skip conversion to FORCED if it looks like an error object
-                    if 'ErrorType' in val_str or 'Error' in type(val).__name__:
-                        return None
-                    # Check if it's a BACnet EngineeringUnits string representation
-                    if 'EngineeringUnits:' in val_str or 'EngineeringUnits(' in val_str:
-                        # Extract the unit name from various formats
-                        import re
-                        match = re.search(r'EngineeringUnits(?:\(|:)\s*([^>)]+)', val_str)
-                        if match:
-                            return match.group(1).strip()
-                    return val_str
-                return str(val)
-            
-            # Make the results jsonable
+            # Make the results jsonable using the unified method
             if 'results' in result:
                 jsonable_results = {}
                 for obj_id, properties in result['results'].items():
                     if isinstance(properties, dict):
-                        # Special handling for units property
                         processed_properties = {}
                         for prop_name, prop_value in properties.items():
+                            # Set context for units conversion
                             if prop_name == 'units' and isinstance(prop_value, int):
-                                # Convert numeric units to EngineeringUnits name
+                                # Handle units specifically - try to convert to EngineeringUnits
                                 try:
                                     from bacpypes3.basetypes import EngineeringUnits
                                     engineering_unit = EngineeringUnits(prop_value)
-                                    # Get the string representation and extract the unit name
                                     unit_str = str(engineering_unit)
-                                    # BACnet EngineeringUnits string format is like "EngineeringUnits(amperes)"
-                                    # or just the name directly, so we need to handle both cases
                                     if unit_str.startswith('EngineeringUnits(') and unit_str.endswith(')'):
-                                        unit_name = unit_str[17:-1]  # Remove "EngineeringUnits(" and ")"
+                                        processed_properties[prop_name] = unit_str[17:-1]  # Remove "EngineeringUnits(" and ")"
                                     else:
-                                        unit_name = unit_str
-                                    processed_properties[prop_name] = unit_name
-                                    logging.getLogger(__name__).debug(f"Converted units {prop_value} to {unit_name} for {obj_id}")
+                                        processed_properties[prop_name] = unit_str
+                                    logging.getLogger(__name__).debug(f"Converted units {prop_value} to {processed_properties[prop_name]} for {obj_id}")
                                 except (ImportError, ValueError, TypeError) as e:
                                     logging.getLogger(__name__).warning(f"Failed to convert units {prop_value} for {obj_id}: {e}")
-                                    processed_properties[prop_name] = make_jsonable(prop_value)
+                                    processed_properties[prop_name] = self.make_jsonable(prop_value)
                             else:
-                                processed_properties[prop_name] = make_jsonable(prop_value)
+                                # Use unified make_jsonable for all other properties
+                                processed_properties[prop_name] = self.make_jsonable(prop_value)
                         jsonable_results[str(obj_id)] = processed_properties
                     else:
-                        jsonable_results[str(obj_id)] = make_jsonable(properties)
+                        jsonable_results[str(obj_id)] = self.make_jsonable(properties)
                 result['results'] = jsonable_results
             
             return json.dumps(result).encode('utf8')
@@ -881,14 +886,36 @@ class BACnetProxy(AsyncioProtocolProxy):
         
         # Cache miss or expired - read from device
         try:
-            _log.debug(f"Reading object-list from device {device_address}")
+            _log.info(f"Reading object-list from device {device_address} with device_object_identifier='{device_object_identifier}'")
             object_list = await self.bacnet.read_property(device_address, device_object_identifier, "object-list")
-            if object_list:
+            
+            # Add detailed logging of what we got back
+            _log.info(f"Raw object-list response from {device_address}: type={type(object_list)}, value={object_list}")
+            
+            # Check for BACnet error responses
+            if isinstance(object_list, (AbortPDU, ErrorPDU, RejectPDU, ErrorRejectAbortNack)):
+                _log.error(f"BACnet error reading object-list from {device_address}: {type(object_list).__name__} - {object_list}")
+                
+                # If it's an ErrorPDU, log more details
+                if isinstance(object_list, ErrorPDU):
+                    error_class = getattr(object_list, 'errorClass', 'Unknown')
+                    error_code = getattr(object_list, 'errorCode', 'Unknown') 
+                    _log.error(f"ErrorPDU details: errorClass={error_class}, errorCode={error_code}")
+                
+                return None
+            
+            # Ensure it's actually a list/iterable
+            if object_list and hasattr(object_list, '__iter__') and not isinstance(object_list, (str, bytes)):
                 self._object_list_cache[cache_key] = (object_list, current_time)
-                _log.debug(f"Cached object-list for {cache_key} with {len(object_list)} objects")
+                _log.info(f"Successfully cached object-list for {cache_key} with {len(object_list)} objects")
                 return object_list
+            else:
+                _log.error(f"Invalid object-list response from {device_address}: type={type(object_list)}, value={object_list}")
+                return None
+                
         except Exception as e:
-            _log.error(f"Error reading object-list from {device_address}: {e}")
+            _log.error(f"Exception reading object-list from {device_address}: {e}")
+            _log.error(f"Exception traceback: {traceback.format_exc()}")
             return None
 
     def _clear_cache_for_device(self, device_address: str, device_object_identifier: str = None):
