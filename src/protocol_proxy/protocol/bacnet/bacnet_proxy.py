@@ -791,11 +791,10 @@ class BACnetProxy(AsyncioProtocolProxy):
 
 class BACnet:
 
-
     def __init__(self, local_device_address, bacnet_network=0, vendor_id=999, object_name='VOLTTRON BACnet Proxy',
                  device_info_cache=None, router_info_cache=None, ase_id=None, **_):
+        print(f"[BACnet.__init__] Initializing BACnet with address={local_device_address}, network={bacnet_network}, vendor_id={vendor_id}, object_name={object_name}")
         _log.debug('WELCOME BAC')
-        # come back here after i finish debugging
         self.learned_networks = set()  # Track discovered BACnet networks
         self.router_responses = []
         self.discovered_devices = {}
@@ -809,42 +808,16 @@ class BACnet:
                                                         networkNumberQuality="configured")
         self.app = Application.from_object_list(
             [device_object, network_port_object],
-            device_info_cache=device_info_cache,  # TODO: If these should be passed in, add to args & launch.
+            device_info_cache=device_info_cache,
             router_info_cache=router_info_cache,
             aseID=ase_id
         )
-        _log.debug(f'WE HAVE AN APP: {self.app.device_info_cache}')
-    # NPDU handler registration not needed in BACpypes3; handled via async indication in Application subclass
-
+        print(f"[BACnet.__init__] BACnet Application initialized: {self.app.device_info_cache}")
 
     async def query_device(self, address: str, property_name: str = 'object-identifier'):
-        """
-        Returns properties about the device at the given address.
-        If a different property name is not given, this will be the object-id.
-        This function allows unicast discovery.
-        This can get everything from device if it is using read_property_multiple and ALL
-        """
+        print(f"[BACnet.query_device] Querying device at address={address} for property={property_name}")
         _log.debug('IN QUERY DEVICE METHOD')
         return await self.read_property(device_address=address, object_identifier='device:4194303', property_identifier=property_name)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     def discover(
         self,
@@ -855,18 +828,15 @@ class BACnet:
         unicast_targets: t.Optional[t.List[str]] = None,
         extra_subnets: t.Optional[t.List[str]] = None,
     ) -> None:
-        """
-        Initiates the discovery process to locate BACnet devices on the network asynchronously, then calls on discovery.
-        """
-        print(f"[discover] Called with networks={networks}, limits={limits}, global_broadcast={global_broadcast}, reset={reset}, unicast_targets={unicast_targets}")
+        print(f"[BACnet.discover] Called with networks={networks}, limits={limits}, global_broadcast={global_broadcast}, reset={reset}, unicast_targets={unicast_targets}, extra_subnets={extra_subnets}")
         try:
-            print("[discover] Getting asyncio loop...")
+            print("[BACnet.discover] Getting asyncio loop...")
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            print("[discover] No running loop, creating new event loop.")
+            print("[BACnet.discover] No running loop, creating new event loop.")
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-        print("[discover] Scheduling _discover task...")
+        print("[BACnet.discover] Scheduling _discover task...")
         asyncio.create_task(
             self._discover(
                 networks=networks,
@@ -888,600 +858,160 @@ class BACnet:
         unicast_targets: t.Optional[t.List[str]] = None,
         extra_subnets: t.Optional[t.List[str]] = None,
     ) -> None:
-        """
-        Internal method to handle discovery logic.
-
-        Updates the `discovered_devices` attribute.
-        """
-        print(f"[_discover] Starting BACnet network discovery with networks={networks}, global_broadcast={global_broadcast}, reset={reset}, timeout={timeout}")
+        print(f"[BACnet._discover] Starting BACnet network discovery with networks={networks}, global_broadcast={global_broadcast}, reset={reset}, timeout={timeout}")
         _log.debug(f"Starting network discovery with parameters: {locals()}")
         if reset:
-            print("[_discover] Resetting learned_networks.")
+            print("[BACnet._discover] Resetting learned_networks.")
             self.learned_networks = set()
             self.router_responses = []
 
-        # Collect networks (focus only on networks/routers)
-        print("[_discover] Collecting BACnet networks and routers...")
+        print("[BACnet._discover] Collecting BACnet networks and routers...")
         network_set = await self.collect_networks(networks, global_broadcast)
-        print(f"[_discover] Networks discovered: {network_set}")
+        print(f"[BACnet._discover] Networks discovered: {network_set}")
 
-        # Print router responses
         if hasattr(self, 'router_responses') and self.router_responses:
-            print(f"[_discover] Routers discovered:")
+            print(f"[BACnet._discover] Routers discovered:")
             for src, router_pdu in self.router_responses:
                 print(f"  Router at {src}, networks: {getattr(router_pdu, 'iartnNetworkList', [])}")
         else:
-            print("[_discover] No routers discovered.")
+            print("[BACnet._discover] No routers discovered.")
 
-        print(f"[_discover] Network discovery complete. Total networks found: {len(network_set)}")
-        # Device discovery logic removed
-
-        # Actively send Who-Is to unicast_targets if provided
-        if unicast_targets:
-            print(f"[_discover] Sending unicast Who-Is to: {unicast_targets}")
-            from bacpypes3.pdu import Address
-            from bacpypes3.apdu import WhoIsRequest
-            for target_ip in unicast_targets:
-                try:
-                    request = WhoIsRequest()
-                    request.pduDestination = Address(target_ip)
-                    print(f"[_discover] Sending Who-Is to {target_ip}")
-                    await self.app.indication(request)
-                except Exception as e:
-                    print(f"[_discover] Failed to send Who-Is to {target_ip}: {e}")
-
-        # If no networks/routers found, brute-force probe BACnet network numbers and local subnets
-        if not network_set:
-            print("[_discover] No BACnet networks found, brute-forcing BACnet network numbers and local IP subnets...")
-            # Brute-force BACnet network numbers 1–100
-            from bacpypes3.npdu import WhoIsRouterToNetwork
-            from bacpypes3.pdu import Address, GlobalBroadcast
-            BRUTE_FORCE_NET_RANGE = range(1, 101)
-            for net_num in BRUTE_FORCE_NET_RANGE:
-                try:
-                    npdu = WhoIsRouterToNetwork(net_num)
-                    npdu.pduDestination = GlobalBroadcast()
-                    print(f"[_discover] Probing BACnet network number: {net_num}")
-                    await self.app.indication(npdu)
-                except Exception as e:
-                    print(f"[_discover] Failed to probe BACnet network {net_num}: {e}")
-            print("[_discover] Brute-force BACnet network number probing complete.")
-
-            # Brute-force probe local IP subnets (as before)
-            HOST_LIMIT = 256  # Maximum number of hosts to probe per subnet
-            # Probe all local subnets, filtering out loopback and link-local networks
-            local_subnets = [net for iface, net in get_connected_networks()]
-            filtered_subnets = []
-            for net in local_subnets:
-                # Always scan detected local subnets (excluding loopback/link-local) AND brute-force all private ranges
-                # Scan detected subnets
-                for net in filtered_subnets:
-                    try:
-                        net_obj = ipaddress.IPv4Network(net, strict=False)
-                        num_hosts = net_obj.num_addresses - 2 if net_obj.num_addresses > 2 else net_obj.num_addresses
-                        print(f"[_discover] Probing subnet: {net} ({num_hosts} hosts)")
-                        ip_count = 0
-                        for ip in net_obj.hosts():
-                            ip_count += 1
-                            target_ip = str(ip)
-                            print(f"    Probing IP: {target_ip} [IP {ip_count}/{num_hosts}]")
-                            try:
-                                request = WhoIsRequest()
-                                request.pduDestination = Address(target_ip)
-                                await self.app.indication(request)
-                            except Exception as e:
-                                print(f"[_discover] Failed to send Who-Is to {target_ip}: {e}")
-                    except Exception as e:
-                        print(f"[_discover] Invalid filtered subnet {net}: {e}")
-
-                # Brute-force ALL common private /24 subnets every time
-                print("[_discover] Brute-forcing ALL common private /24 subnets in addition to detected subnets...")
-                total_subnets = 256 + 256*256 + 16*256
-                subnet_count = 0
-                # 192.168.0.0/24 to 192.168.255.0/24
-                for i in range(256):
-                    net = f"192.168.{i}.0/24"
-                    subnet_count += 1
-                    try:
-                        net_obj = ipaddress.IPv4Network(net, strict=False)
-                        print(f"[_discover] Probing brute subnet: {net} (254 hosts) [Subnet {subnet_count}/{total_subnets}]")
-                        ip_count = 0
-                        for ip in net_obj.hosts():
-                            ip_count += 1
-                            target_ip = str(ip)
-                            print(f"    Probing IP: {target_ip} [IP {ip_count}/254]")
-                            try:
-                                request = WhoIsRequest()
-                                request.pduDestination = Address(target_ip)
-                                await self.app.indication(request)
-                            except Exception as e:
-                                print(f"[_discover] Failed to send Who-Is to {target_ip}: {e}")
-                    except Exception as e:
-                        print(f"[_discover] Invalid brute subnet {net}: {e}")
-                # 10.0.0.0/24 to 10.255.255.0/24
-                for i in range(256):
-                    for j in range(256):
-                        net = f"10.{i}.{j}.0/24"
-                        subnet_count += 1
-                        try:
-                            net_obj = ipaddress.IPv4Network(net, strict=False)
-                            print(f"[_discover] Probing brute subnet: {net} (254 hosts) [Subnet {subnet_count}/{total_subnets}]")
-                            ip_count = 0
-                            for ip in net_obj.hosts():
-                                ip_count += 1
-                                target_ip = str(ip)
-                                print(f"    Probing IP: {target_ip} [IP {ip_count}/254]")
-                                try:
-                                    request = WhoIsRequest()
-                                    request.pduDestination = Address(target_ip)
-                                    await self.app.indication(request)
-                                except Exception as e:
-                                    print(f"[_discover] Failed to send Who-Is to {target_ip}: {e}")
-                        except Exception as e:
-                            print(f"[_discover] Invalid brute subnet {net}: {e}")
-                # 172.16.0.0/24 to 172.31.255.0/24
-                for i in range(16, 32):
-                    for j in range(256):
-                        net = f"172.{i}.{j}.0/24"
-                        subnet_count += 1
-                        try:
-                            net_obj = ipaddress.IPv4Network(net, strict=False)
-                            print(f"[_discover] Probing brute subnet: {net} (254 hosts) [Subnet {subnet_count}/{total_subnets}]")
-                            ip_count = 0
-                            for ip in net_obj.hosts():
-                                ip_count += 1
-                                target_ip = str(ip)
-                                print(f"    Probing IP: {target_ip} [IP {ip_count}/254]")
-                                try:
-                                    request = WhoIsRequest()
-                                    request.pduDestination = Address(target_ip)
-                                    await self.app.indication(request)
-                                except Exception as e:
-                                    print(f"[_discover] Failed to send Who-Is to {target_ip}: {e}")
-                        except Exception as e:
-                            print(f"[_discover] Invalid brute subnet {net}: {e}")
-                # No subnets detected, brute-force all common private /24 subnets
-                print("[_discover] No local subnets detected, brute-forcing ALL common private /24 subnets...")
-                # 192.168.0.0/24 to 192.168.255.0/24
-                total_subnets = 256 + 256*256 + 16*256
-                subnet_count = 0
-                # 192.168.0.0/24 to 192.168.255.0/24
-                for i in range(256):
-                    net = f"192.168.{i}.0/24"
-                    subnet_count += 1
-                    try:
-                        net_obj = ipaddress.IPv4Network(net, strict=False)
-                        print(f"[_discover] Probing brute subnet: {net} (254 hosts) [Subnet {subnet_count}/{total_subnets}]")
-                        ip_count = 0
-                        for ip in net_obj.hosts():
-                            ip_count += 1
-                            target_ip = str(ip)
-                            print(f"    Probing IP: {target_ip} [IP {ip_count}/254]")
-                            try:
-                                request = WhoIsRequest()
-                                request.pduDestination = Address(target_ip)
-                                await self.app.indication(request)
-                            except Exception as e:
-                                print(f"[_discover] Failed to send Who-Is to {target_ip}: {e}")
-                    except Exception as e:
-                        print(f"[_discover] Invalid brute subnet {net}: {e}")
-                # 10.0.0.0/24 to 10.255.255.0/24
-                for i in range(256):
-                    for j in range(256):
-                        net = f"10.{i}.{j}.0/24"
-                        subnet_count += 1
-                        try:
-                            net_obj = ipaddress.IPv4Network(net, strict=False)
-                            print(f"[_discover] Probing brute subnet: {net} (254 hosts) [Subnet {subnet_count}/{total_subnets}]")
-                            ip_count = 0
-                            for ip in net_obj.hosts():
-                                ip_count += 1
-                                target_ip = str(ip)
-                                print(f"    Probing IP: {target_ip} [IP {ip_count}/254]")
-                                try:
-                                    request = WhoIsRequest()
-                                    request.pduDestination = Address(target_ip)
-                                    await self.app.indication(request)
-                                except Exception as e:
-                                    print(f"[_discover] Failed to send Who-Is to {target_ip}: {e}")
-                        except Exception as e:
-                            print(f"[_discover] Invalid brute subnet {net}: {e}")
-                # 172.16.0.0/24 to 172.31.255.0/24
-                for i in range(16, 32):
-                    for j in range(256):
-                        net = f"172.{i}.{j}.0/24"
-                        subnet_count += 1
-                        try:
-                            net_obj = ipaddress.IPv4Network(net, strict=False)
-                            print(f"[_discover] Probing brute subnet: {net} (254 hosts) [Subnet {subnet_count}/{total_subnets}]")
-                            ip_count = 0
-                            for ip in net_obj.hosts():
-                                ip_count += 1
-                                target_ip = str(ip)
-                                print(f"    Probing IP: {target_ip} [IP {ip_count}/254]")
-                                try:
-                                    request = WhoIsRequest()
-                                    request.pduDestination = Address(target_ip)
-                                    await self.app.indication(request)
-                                except Exception as e:
-                                    print(f"[_discover] Failed to send Who-Is to {target_ip}: {e}")
-                        except Exception as e:
-                            print(f"[_discover] Invalid brute subnet {net}: {e}")
-                # 10.0.0.0/24 to 10.255.255.0/24
-                for i in range(256):
-                    for j in range(256):
-                        net = f"10.{i}.{j}.0/24"
-                        try:
-                            net_obj = ipaddress.IPv4Network(net, strict=False)
-                            print(f"[_discover] Probing brute subnet: {net} (254 hosts)")
-                            for ip in net_obj.hosts():
-                                target_ip = str(ip)
-                                try:
-                                    request = WhoIsRequest()
-                                    request.pduDestination = Address(target_ip)
-                                    await self.app.indication(request)
-                                except Exception as e:
-                                    print(f"[_discover] Failed to send Who-Is to {target_ip}: {e}")
-                        except Exception as e:
-                            print(f"[_discover] Invalid brute subnet {net}: {e}")
-                # 172.16.0.0/24 to 172.31.255.0/24
-                for i in range(16, 32):
-                    for j in range(256):
-                        net = f"172.{i}.{j}.0/24"
-                        try:
-                            net_obj = ipaddress.IPv4Network(net, strict=False)
-                            print(f"[_discover] Probing brute subnet: {net} (254 hosts)")
-                            for ip in net_obj.hosts():
-                                target_ip = str(ip)
-                                try:
-                                    request = WhoIsRequest()
-                                    request.pduDestination = Address(target_ip)
-                                    await self.app.indication(request)
-                                except Exception as e:
-                                    print(f"[_discover] Failed to send Who-Is to {target_ip}: {e}")
-                        except Exception as e:
-                            print(f"[_discover] Invalid brute subnet {net}: {e}")
-            else:
-                for net in filtered_subnets:
-                    try:
-                        net_obj = ipaddress.IPv4Network(net, strict=False)
-                        num_hosts = net_obj.num_addresses - 2 if net_obj.num_addresses > 2 else net_obj.num_addresses
-                        print(f"[_discover] Probing subnet: {net} ({num_hosts} hosts)")
-                        ip_count = 0
-                        for ip in net_obj.hosts():
-                            ip_count += 1
-                            target_ip = str(ip)
-                            print(f"    Probing IP: {target_ip} [IP {ip_count}/{num_hosts}]")
-                            try:
-                                request = WhoIsRequest()
-                                request.pduDestination = Address(target_ip)
-                                await self.app.indication(request)
-                            except Exception as e:
-                                print(f"[_discover] Failed to send Who-Is to {target_ip}: {e}")
-                    except Exception as e:
-                        print(f"[_discover] Invalid filtered subnet {net}: {e}")
-            # Probe any extra subnets specified by the user
-            if extra_subnets:
-                for net in extra_subnets:
-                    try:
-                        net_obj = ipaddress.IPv4Network(net, strict=False)
-                        num_hosts = net_obj.num_addresses - 2 if net_obj.num_addresses > 2 else net_obj.num_addresses
-                        if num_hosts > HOST_LIMIT:
-                            print(f"[_discover] Skipping extra subnet {net} (too large: {num_hosts} hosts)")
-                            continue
-                        print(f"[_discover] Probing extra subnet: {net} ({num_hosts} hosts)")
-                        for ip in net_obj.hosts():
-                            target_ip = str(ip)
-                            try:
-                                request = WhoIsRequest()
-                                request.pduDestination = Address(target_ip)
-                                await self.app.indication(request)
-                            except Exception as e:
-                                print(f"[_discover] Failed to send Who-Is to {target_ip}: {e}")
-                    except Exception as e:
-                        print(f"[_discover] Invalid extra subnet {net}: {e}")
-            print("[_discover] Brute-force probing complete.")
+        print(f"[BACnet._discover] Network discovery complete. Total networks found: {len(network_set)}")
 
     async def collect_networks(self, networks: t.Union[str, t.List[int], int], global_broadcast: bool = False) -> t.Set[int]:
-        """
-        Collects BACnet network numbers to discover devices from.
-
-        Parameters:
-        - networks: A list or single network number. If "known", uses `learned_networks`.
-        - global_broadcast: Indicates whether routers should be discovered globally.
-
-        Returns:
-        - A set of network numbers to query.
-        """
+        print(f"[BACnet.collect_networks] Collecting networks with input={networks}, global_broadcast={global_broadcast}")
         network_set = self.learned_networks.copy()
 
-        # Add the local network number if available
         local_network = await self.what_is_network_number()
+        print(f"[BACnet.collect_networks] Local network number: {local_network}")
         if local_network:
             network_set.add(local_network)
 
-        # Discover routers to networks
         routers = await self.whois_router_to_network()
+        print(f"[BACnet.collect_networks] Routers found: {routers}")
         if not routers:
             routers = await self.whois_router_to_network(global_broadcast=True)
+            print(f"[BACnet.collect_networks] Routers found with global broadcast: {routers}")
 
         for _, response in routers:
             network_set.update(response.iartnNetworkList)
 
-        # Expand network set based on user-specified networks
         if isinstance(networks, list):
             network_set.update(int(n) for n in networks if n < 65535)
         elif isinstance(networks, int) and networks < 65535:
             network_set.add(networks)
         elif networks == "known":
-            pass  # Keep the current learned networks
+            pass
 
+        print(f"[BACnet.collect_networks] Final network set: {network_set}")
         return network_set
 
-    def _process_iam_responses(self, responses: t.List[t.Tuple[object, t.Optional[int]]]) -> None:
-        """
-        Processes I-Am responses from BACnet devices and updates `discovered_devices`.
-
-        Parameters:
-        - responses: List of tuples containing the I-Am response and network number.
-        """
-        for iam_request, network_number in responses:
-            # Handle both dict and object types for device info
-            if isinstance(iam_request, dict):
-                objid = iam_request.get("deviceIdentifier")
-                device_address = iam_request.get("pduSource")
-                vendor_id = iam_request.get("vendorID")
-            else:
-                objid = getattr(iam_request, "deviceIdentifier", None)
-                device_address = getattr(iam_request, "pduSource", None)
-                vendor_id = getattr(iam_request, "vendorID", None)
-            key = str(objid)
-            if key not in self.discovered_devices:
-                self.discovered_devices[key] = {
-                    "object_instance": objid,
-                    "address": device_address,
-                    "network_number": {network_number} if network_number is not None else set(),
-                    "vendor_id": vendor_id,
-                    "vendor_name": "unknown",
-                }
-            else:
-                self.discovered_devices[key]["network_number"].add(network_number)
-
     async def what_is_network_number(self) -> t.Optional[int]:
-        """
-        Returns the local BACnet network number by querying the network port object.
-        """
+        print("[BACnet.what_is_network_number] Querying local network number...")
         try:
-            # Try to read the network number property from the local network port object
             result = await self.read_property(
                 device_address="local",
                 object_identifier="network-port:0",
                 property_identifier="network-number"
             )
+            print(f"[BACnet.what_is_network_number] Result: {result}")
             if isinstance(result, int):
                 return result
-            # Only call get_value if not an error type
             if hasattr(result, 'get_value') and not isinstance(result, ErrorRejectAbortNack):
                 return result.get_value()
         except Exception as e:
+            print(f"[BACnet.what_is_network_number] Error: {e}")
             _log.error(f"Error getting local network number: {e}")
         return None
 
     async def whois_router_to_network(self, global_broadcast: bool = False) -> list:
-        """
-        Discovers routers to other BACnet networks using Who-Is-Router-To-Network service.
-        Returns a list of tuples (source, response) for each discovered router.
-        """
+        print(f"[BACnet.whois_router_to_network] Discovering routers with global_broadcast={global_broadcast}")
         try:
             self.router_responses = []
-            # Build and send Who-IsRouterToNetwork NPDU
             from bacpypes3.npdu import WhoIsRouterToNetwork
             from bacpypes3.pdu import Address, GlobalBroadcast
             npdu = WhoIsRouterToNetwork()
             destination = GlobalBroadcast() if global_broadcast else Address("255.255.255.255")
             npdu.pduDestination = destination
             await self.app.indication(npdu)
-            # Wait for responses (simple sleep, could be improved with event/queue)
             await asyncio.sleep(3)
+            print(f"[BACnet.whois_router_to_network] Router responses: {self.router_responses}")
             return self.router_responses
         except Exception as e:
+            print(f"[BACnet.whois_router_to_network] Error during router discovery: {e}")
             _log.error(f"Error during router discovery: {e}")
             return []
 
     def indication(self, pdu):
-        # NPDU handler for router discovery
+        print(f"[BACnet.indication] Received PDU: {pdu}")
         from bacpypes3.npdu import IAmRouterToNetwork
         if isinstance(pdu, IAmRouterToNetwork):
+            print(f"[BACnet.indication] IAmRouterToNetwork received from {getattr(pdu, 'pduSource', None)}")
             self.router_responses.append((getattr(pdu, "pduSource", None), pdu))
-  
 
 
+def tempNameGoaltoSendUserlistNetwork(proxy=None, suspected_address=None):
+    print("[tempNameGoaltoSendUserlistNetwork] Starting full network discovery process...")
+    discovered_networks = set()
+    routed_networks_info = {}
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# --- Utility Functions ---
-
-def get_connected_networks():
-    """
-    Returns a list of (interface, subnet) tuples for all IPv4 interfaces.
-    """
-    networks = []
-    interfaces = psutil.net_if_addrs()
-    for interface, addrs in interfaces.items():
-        for addr in addrs:
-            if getattr(addr, 'family', None) == socket.AF_INET:
-                ip = addr.address
-                netmask = addr.netmask
-                if ip and netmask:
-                    try:
-                        net = ipaddress.IPv4Network(f"{ip}/{netmask}", strict=False)
-                        networks.append((interface, str(net)))
-                    except Exception:
-                        pass
-    return networks
-
-def scan_wifi_windows():
-    """
-    Scans for Wi-Fi networks on Windows using netsh.
-    Returns a list of dicts with SSID and BSSID.
-    """
-    output = subprocess.check_output(["netsh", "wlan", "show", "networks", "mode=bssid"])
-    networks = []
-    lines = output.decode("utf-8", errors="ignore").splitlines()
-    current_ssid = None
-    for line in lines:
-        line = line.strip()
-        if line.startswith("SSID "):
-            current_ssid = line.split(" : ")[-1]
-        elif line.startswith("BSSID") and current_ssid:
-            bssid = line.split(" : ")[-1]
-            networks.append({"ssid": current_ssid, "bssid": bssid})
-    return networks
-
-
-
-
-def launch_bacnet(parser: ArgumentParser) -> tuple[ArgumentParser, Type[AsyncioProtocolProxy]]:
-    parser.add_argument('--local-device-address', type=str, required=True,
-                        help='Address on the local machine of this BACnet Proxy.')
-    parser.add_argument('--bacnet-network', type=int, default=0,
-                        help='The BACnet port as an offset from 47808.')
-    parser.add_argument('--vendor-id', type=int, default=999,
-                        help='The BACnet vendor ID to use for the local device of this BACnet Proxy.')
-    parser.add_argument('--object-name', type=str, default='VOLTTRON BACnet Proxy',
-                        help='The name of the local device for this BACnet Proxy.')
-    return parser, BACnetProxy
-
-
-if __name__ == '__main__':
-    sys.exit(launch(launch_bacnet))
-
-
-def discover_bacnet_networks(proxy):
-    """Try to discover BACnet networks using BACnet Who-Is and router discovery."""
-    try:
-        loop = asyncio.get_event_loop()
-        networks = loop.run_until_complete(proxy.collect_networks("known"))
-        return set(networks)
-    except Exception:
-        return set()
-
-def get_routing_table_networks():
-    networks = set()
-    if platform.system() == "Windows" or "microsoft" in platform.release().lower():
-        networks = set(get_windows_routed_networks().keys())
+    print("Step 1: BACnet discovery...")
+    if proxy:
+        bacnet_nets = discover_bacnet_networks(proxy)
+        print(f"  BACnet networks found: {bacnet_nets}")
+        discovered_networks |= bacnet_nets
     else:
-        try:
-            output = subprocess.check_output(["ip", "route"], text=True)
-            for line in output.splitlines():
-                parts = line.split()
-                if parts and parts[0].count('.') == 3:
-                    subnet = parts[0]
-                    if '/' not in subnet:
-                        subnet += '/24'
-                    networks.add(subnet)
-        except Exception:
-            pass
-    return networks
+        print("  Skipping BACnet discovery (no proxy provided).")
 
-def get_arp_table_networks():
-    networks = set()
-    try:
-        if platform.system() == "Windows":
-            arp_output = subprocess.check_output(["arp", "-a"], text=True, errors="ignore")
-        else:
-            arp_output = subprocess.check_output(["ip", "neigh"], text=True, errors="ignore")
-        for line in arp_output.splitlines():
-            parts = line.split()
-            if platform.system() == "Windows":
-                if len(parts) >= 2:
-                    ip = parts[1]
-            else:
-                if len(parts) >= 1:
-                    ip = parts[0]
-            try:
-                ipaddress.IPv4Address(ip)
-                subnet = f"{ip.rsplit('.', 1)[0]}.0/24"
-                networks.add(subnet)
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return networks
+    print("Step 2: Collecting networks from routing table...")
+    if platform.system() == "Windows" or "microsoft" in platform.release().lower():
+        routed_networks_info = get_windows_routed_networks()
+        routing_nets = set(routed_networks_info.keys())
+    else:
+        routing_nets = get_routing_table_networks()
+    print(f"  Routing table networks found: {routing_nets}")
+    discovered_networks |= routing_nets
 
-def get_common_networks():
-    return {
-        "192.168.0.0/24",
-        "192.168.1.0/24",
-        "10.0.0.0/24",
-        "10.1.1.0/24",
-        "172.16.0.0/24",
-        "172.16.1.0/24",
-    }
+    print("Step 3: Collecting networks from ARP table...")
+    arp_nets = get_arp_table_networks()
+    print(f"  ARP table networks found: {arp_nets}")
+    discovered_networks |= arp_nets
+
+    print("Step 4: Adding common networks...")
+    common_nets = get_common_networks()
+    print(f"  Common networks added: {common_nets}")
+    discovered_networks |= common_nets
+
+    print("Step 5: Probing all discovered networks...")
+    active_networks = probe_networks(discovered_networks, routed_networks_info)
+    return active_networks
 
 def probe_networks(networks, routed_networks_info=None):
     import nmap
     active_networks = {}
     for subnet in networks:
+        print(f"[probe_networks] Probing subnet: {subnet}")
         net_base = subnet.split('/')[0].rsplit('.', 1)[0] + '.'
         probe_ips = [f"{net_base}1", f"{net_base}254"]
         for ip in probe_ips:
+            print(f"[probe_networks] Pinging IP: {ip}")
             try:
                 scanner = nmap.PortScanner()
                 scanner.scan(hosts=ip, arguments='-sn --host-timeout 5s')
                 if any(scanner[host].state() == 'up' for host in scanner.all_hosts()):
                     info = routed_networks_info.get(subnet, {}) if routed_networks_info else {}
                     active_networks[subnet] = info
+                    print(f"[probe_networks] Active network found: {subnet} {info}")
                     break
-            except Exception:
-                pass
-    return active_networks
-
-def tempNameGoaltoSendUserlistNetwork(proxy=None):
-    discovered_networks = set()
-    routed_networks_info = {}
-
-    if proxy:
-        bacnet_nets = discover_bacnet_networks(proxy)
-        discovered_networks |= bacnet_nets
-
-    if platform.system() == "Windows" or "microsoft" in platform.release().lower():
-        routed_networks_info = get_windows_routed_networks()
-        routing_nets = set(routed_networks_info.keys())
-    else:
-        routing_nets = get_routing_table_networks()
-    discovered_networks |= routing_nets
-
-    arp_nets = get_arp_table_networks()
-    discovered_networks |= arp_nets
-
-    common_nets = get_common_networks()
-    discovered_networks |= common_nets
-
-    active_networks = probe_networks(discovered_networks, routed_networks_info)
+            except Exception as e:
+                print(f"[probe_networks] Error probing {ip}: {e}")
+    print(f"[probe_networks] Active networks: {active_networks}")
     return active_networks
 
 def get_windows_routed_networks():
+    """
+    Returns a dictionary of routed IPv4 networks on Windows from netstat.exe -r.
+    """
     import subprocess
     import re
     import ipaddress
@@ -1511,7 +1041,62 @@ def get_windows_routed_networks():
                         }
                 except Exception:
                     pass
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[get_windows_routed_networks] Error running netstat.exe -r: {e}")
     return routed_networks
+
+def get_arp_table_networks():
+    """
+    Returns a set of networks found in the ARP table.
+    Works for both Windows and Linux.
+    """
+    import subprocess
+    import ipaddress
+    import platform
+    networks = set()
+    try:
+        if platform.system() == "Windows":
+            arp_output = subprocess.check_output(["arp", "-a"], text=True, errors="ignore")
+            for line in arp_output.splitlines():
+                parts = line.split()
+                if len(parts) >= 2:
+                    ip = parts[1]
+                    try:
+                        ipaddress.IPv4Address(ip)
+                        subnet = f"{ip.rsplit('.', 1)[0]}.0/24"
+                        networks.add(subnet)
+                    except Exception:
+                        pass
+        else:
+            arp_output = subprocess.check_output(["ip", "neigh"], text=True, errors="ignore")
+            for line in arp_output.splitlines():
+                parts = line.split()
+                if len(parts) >= 1:
+                    ip = parts[0]
+                    try:
+                        ipaddress.IPv4Address(ip)
+                        subnet = f"{ip.rsplit('.', 1)[0]}.0/24"
+                        networks.add(subnet)
+                    except Exception:
+                        pass
+    except Exception as e:
+        print(f"[get_arp_table_networks] ARP table scan failed: {e}")
+    print(f"[get_arp_table_networks] Networks found: {networks}")
+    return networks
+
+def get_common_networks():
+    """
+    Returns a set of common private IPv4 networks.
+    """
+    common = {
+        "192.168.0.0/24",
+        "192.168.1.0/24",
+        "10.0.0.0/24",
+        "10.1.1.0/24",
+        "172.16.0.0/24",
+        "172.16.1.0/24",
+    }
+    print(f"[get_common_networks] Common networks: {common}")
+    return common
+
 
