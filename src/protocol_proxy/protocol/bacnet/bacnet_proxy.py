@@ -956,14 +956,7 @@ def tempNameGoaltoSendUserlistNetwork(proxy=None, suspected_address=None):
     routed_networks_info = {}
 
     print("Step 1: BACnet discovery...")
-    if proxy:
-        bacnet_nets = discover_bacnet_networks(proxy)
-        print(f"  BACnet networks found: {bacnet_nets}")
-        discovered_networks |= bacnet_nets
-    else:
-        print("  Skipping BACnet discovery (no proxy provided).")
-
-    print("Step 2: Collecting networks from routing table...")
+    # Collect networks from routing, ARP, common, and suspected
     if platform.system() == "Windows" or "microsoft" in platform.release().lower():
         routed_networks_info = get_windows_routed_networks()
         routing_nets = set(routed_networks_info.keys())
@@ -972,17 +965,29 @@ def tempNameGoaltoSendUserlistNetwork(proxy=None, suspected_address=None):
     print(f"  Routing table networks found: {routing_nets}")
     discovered_networks |= routing_nets
 
-    print("Step 3: Collecting networks from ARP table...")
     arp_nets = get_arp_table_networks()
     print(f"  ARP table networks found: {arp_nets}")
     discovered_networks |= arp_nets
 
-    print("Step 4: Adding common networks...")
     common_nets = get_common_networks()
     print(f"  Common networks added: {common_nets}")
     discovered_networks |= common_nets
 
-    print("Step 5: Probing all discovered networks...")
+    if suspected_address:
+        discovered_networks.add(suspected_address)
+
+    # BACnet broadcast discovery across all networks
+    if proxy:
+        import asyncio
+        loop = asyncio.get_event_loop()
+        bacnet_devices = loop.run_until_complete(
+            discover_bacnet_devices_on_all_networks(proxy, discovered_networks)
+        )
+        print(f"BACnet devices found: {bacnet_devices}")
+        # Optionally, return or process these devices
+        return bacnet_devices
+
+    print("Step 5: Probing all discovered networks (fallback)...")
     active_networks = probe_networks(discovered_networks, routed_networks_info)
     return active_networks
 
@@ -1098,5 +1103,33 @@ def get_common_networks():
     }
     print(f"[get_common_networks] Common networks: {common}")
     return common
+
+async def discover_bacnet_devices_on_subnet(proxy, subnet_address, device_instance_low=0, device_instance_high=4194303):
+    """
+    Uses BACnet Who-Is broadcast to search for devices on a specific subnet/network.
+    """
+    print(f"[discover_bacnet_devices_on_subnet] Broadcasting Who-Is to {subnet_address} for device instances {device_instance_low}-{device_instance_high}")
+    try:
+        devices = await proxy.who_is(device_instance_low, device_instance_high, f"{subnet_address}:47808")
+        print(f"[discover_bacnet_devices_on_subnet] Devices found: {devices}")
+        return devices
+    except Exception as e:
+        print(f"[discover_bacnet_devices_on_subnet] Error during BACnet broadcast: {e}")
+        return []
+
+async def discover_bacnet_devices_on_all_networks(proxy, networks, device_instance_low=0, device_instance_high=4194303):
+    """
+    Uses BACnet Who-Is broadcast to search for devices on all provided networks/subnets.
+    """
+    all_devices = []
+    for subnet in networks:
+        print(f"[discover_bacnet_devices_on_all_networks] Broadcasting Who-Is to {subnet}")
+        try:
+            devices = await proxy.who_is(device_instance_low, device_instance_high, f"{subnet.split('/')[0]}:47808")
+            print(f"[discover_bacnet_devices_on_all_networks] Devices found on {subnet}: {devices}")
+            all_devices.extend(devices)
+        except Exception as e:
+            print(f"[discover_bacnet_devices_on_all_networks] Error during BACnet broadcast to {subnet}: {e}")
+    return all_devices
 
 
