@@ -1333,6 +1333,330 @@ class BACnet:
         return await self.read_property(device_address=address, object_identifier='device:4194303',
                                         property_identifier=property_name)
 
+
+
+    async def query_device(self, address: str, property_name: str = 'object-identifier'):
+        print(f"[BACnet.query_device] Querying device at address={address} for property={property_name}")
+        _log.debug('IN QUERY DEVICE METHOD')
+        return await self.read_property(device_address=address, object_identifier='device:4194303', property_identifier=property_name)
+
+    def discover(
+        self,
+        networks: t.Union[str, t.List[int], int] = "known",
+        limits: t.Tuple[int, int] = (0, 4194303),
+        global_broadcast: bool = False,
+        reset: bool = False,
+        unicast_targets: t.Optional[t.List[str]] = None,
+        extra_subnets: t.Optional[t.List[str]] = None,
+    ) -> None:
+        print(f"[BACnet.discover] Called with networks={networks}, limits={limits}, global_broadcast={global_broadcast}, reset={reset}, unicast_targets={unicast_targets}, extra_subnets={extra_subnets}")
+        try:
+            print("[BACnet.discover] Getting asyncio loop...")
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            print("[BACnet.discover] No running loop, creating new event loop.")
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        print("[BACnet.discover] Scheduling _discover task...")
+        asyncio.create_task(
+            self._discover(
+                networks=networks,
+                limits=limits,
+                global_broadcast=global_broadcast,
+                reset=reset,
+                unicast_targets=unicast_targets,
+                extra_subnets=extra_subnets
+            )
+        )
+
+    async def _discover(
+        self,
+        networks: t.Union[str, t.List[int], int],
+        limits: t.Tuple[int, int],
+        global_broadcast: bool,
+        reset: bool,
+        timeout: int = 30,
+        unicast_targets: t.Optional[t.List[str]] = None,
+        extra_subnets: t.Optional[t.List[str]] = None,
+    ) -> None:
+        print(f"[BACnet._discover] Starting BACnet network discovery with networks={networks}, global_broadcast={global_broadcast}, reset={reset}, timeout={timeout}")
+        _log.debug(f"Starting network discovery with parameters: {locals()}")
+        if reset:
+            print("[BACnet._discover] Resetting learned_networks.")
+            self.learned_networks = set()
+            self.router_responses = []
+
+        print("[BACnet._discover] Collecting BACnet networks and routers...")
+        network_set = await self.collect_networks(networks, global_broadcast)
+        print(f"[BACnet._discover] Networks discovered: {network_set}")
+
+        if hasattr(self, 'router_responses') and self.router_responses:
+            print(f"[BACnet._discover] Routers discovered:")
+            for src, router_pdu in self.router_responses:
+                print(f"  Router at {src}, networks: {getattr(router_pdu, 'iartnNetworkList', [])}")
+        else:
+            print("[BACnet._discover] No routers discovered.")
+
+        print(f"[BACnet._discover] Network discovery complete. Total networks found: {len(network_set)}")
+
+    async def collect_networks(self, networks: t.Union[str, t.List[int], int], global_broadcast: bool = False) -> t.Set[int]:
+        print(f"[BACnet.collect_networks] Collecting networks with input={networks}, global_broadcast={global_broadcast}")
+        network_set = self.learned_networks.copy()
+
+        local_network = await self.what_is_network_number()
+        print(f"[BACnet.collect_networks] Local network number: {local_network}")
+        if local_network:
+            network_set.add(local_network)
+
+        routers = await self.whois_router_to_network()
+        print(f"[BACnet.collect_networks] Routers found: {routers}")
+        if not routers:
+            routers = await self.whois_router_to_network(global_broadcast=True)
+            print(f"[BACnet.collect_networks] Routers found with global broadcast: {routers}")
+
+        for _, response in routers:
+            network_set.update(response.iartnNetworkList)
+
+        if isinstance(networks, list):
+            network_set.update(int(n) for n in networks if n < 65535)
+        elif isinstance(networks, int) and networks < 65535:
+            network_set.add(networks)
+        elif networks == "known":
+            pass
+
+        print(f"[BACnet.collect_networks] Final network set: {network_set}")
+        return network_set
+
+    async def what_is_network_number(self) -> t.Optional[int]:
+        print("[BACnet.what_is_network_number] Querying local network number...")
+        try:
+            result = await self.read_property(
+                device_address="local",
+                object_identifier="network-port:0",
+                property_identifier="network-number"
+            )
+            print(f"[BACnet.what_is_network_number] Result: {result}")
+            if isinstance(result, int):
+                return result
+            if hasattr(result, 'get_value') and not isinstance(result, ErrorRejectAbortNack):
+                return result.get_value()
+        except Exception as e:
+            print(f"[BACnet.what_is_network_number] Error: {e}")
+            _log.error(f"Error getting local network number: {e}")
+        return None
+
+    async def whois_router_to_network(self, global_broadcast: bool = False) -> list:
+        print(f"[BACnet.whois_router_to_network] Discovering routers with global_broadcast={global_broadcast}")
+        try:
+            self.router_responses = []
+            from bacpypes3.npdu import WhoIsRouterToNetwork
+            from bacpypes3.pdu import Address, GlobalBroadcast
+            npdu = WhoIsRouterToNetwork()
+            destination = GlobalBroadcast() if global_broadcast else Address("255.255.255.255")
+            npdu.pduDestination = destination
+            await self.app.indication(npdu)
+            await asyncio.sleep(3)
+            print(f"[BACnet.whois_router_to_network] Router responses: {self.router_responses}")
+            return self.router_responses
+        except Exception as e:
+            print(f"[BACnet.whois_router_to_network] Error during router discovery: {e}")
+            _log.error(f"Error during router discovery: {e}")
+            return []
+
+    def indication(self, pdu):
+        print(f"[BACnet.indication] Received PDU: {pdu}")
+        from bacpypes3.npdu import IAmRouterToNetwork
+        if isinstance(pdu, IAmRouterToNetwork):
+            print(f"[BACnet.indication] IAmRouterToNetwork received from {getattr(pdu, 'pduSource', None)}")
+            self.router_responses.append((getattr(pdu, "pduSource", None), pdu))
+
+
+def tempNameGoaltoSendUserlistNetwork(proxy=None, suspected_address=None):
+    print("[tempNameGoaltoSendUserlistNetwork] Starting full network discovery process...")
+    discovered_networks = set()
+    routed_networks_info = {}
+
+    print("Step 1: BACnet discovery...")
+    # Collect networks from routing, ARP, common, and suspected
+    if platform.system() == "Windows" or "microsoft" in platform.release().lower():
+        routed_networks_info = get_windows_routed_networks()
+        routing_nets = set(routed_networks_info.keys())
+    else:
+        routing_nets = get_routing_table_networks()
+    print(f"  Routing table networks found: {routing_nets}")
+    discovered_networks |= routing_nets
+
+    arp_nets = get_arp_table_networks()
+    print(f"  ARP table networks found: {arp_nets}")
+    discovered_networks |= arp_nets
+
+    common_nets = get_common_networks()
+    print(f"  Common networks added: {common_nets}")
+    discovered_networks |= common_nets
+
+    if suspected_address:
+        discovered_networks.add(suspected_address)
+
+    # BACnet broadcast discovery across all networks
+    if proxy:
+        import asyncio
+        loop = asyncio.get_event_loop()
+        bacnet_devices = loop.run_until_complete(
+            discover_bacnet_devices_on_all_networks(proxy, discovered_networks)
+        )
+        print(f"BACnet devices found: {bacnet_devices}")
+        # Optionally, return or process these devices
+        return bacnet_devices
+
+    print("Step 5: Probing all discovered networks (fallback)...")
+    active_networks = probe_networks(discovered_networks, routed_networks_info)
+    return active_networks
+
+def probe_networks(networks, routed_networks_info=None):
+    import nmap
+    active_networks = {}
+    for subnet in networks:
+        print(f"[probe_networks] Probing subnet: {subnet}")
+        net_base = subnet.split('/')[0].rsplit('.', 1)[0] + '.'
+        probe_ips = [f"{net_base}1", f"{net_base}254"]
+        for ip in probe_ips:
+            print(f"[probe_networks] Pinging IP: {ip}")
+            try:
+                scanner = nmap.PortScanner()
+                scanner.scan(hosts=ip, arguments='-sn --host-timeout 5s')
+                if any(scanner[host].state() == 'up' for host in scanner.all_hosts()):
+                    info = routed_networks_info.get(subnet, {}) if routed_networks_info else {}
+                    active_networks[subnet] = info
+                    print(f"[probe_networks] Active network found: {subnet} {info}")
+                    break
+            except Exception as e:
+                print(f"[probe_networks] Error probing {ip}: {e}")
+    print(f"[probe_networks] Active networks: {active_networks}")
+    return active_networks
+
+def get_windows_routed_networks():
+    """
+    Returns a dictionary of routed IPv4 networks on Windows from netstat.exe -r.
+    """
+    import subprocess
+    import re
+    import ipaddress
+    routed_networks = {}
+    try:
+        output = subprocess.check_output(["netstat.exe", "-r"], text=True)
+        for line in output.splitlines():
+            match = re.match(
+                r"^\s*(\d+\.\d+\.\d+\.\d+)\s+"
+                r"(\d+\.\d+\.\d+\.\d+)\s+"
+                r"(\S+)\s+"
+                r"(\d+\.\d+\.\d+\.\d+)", line)
+            if match:
+                dest, netmask, gateway, interface = match.groups()
+                try:
+                    net = ipaddress.IPv4Network(f"{dest}/{netmask}", strict=False)
+                    if (
+                        net.prefixlen >= 24 and
+                        not net.is_loopback and
+                        not net.is_multicast and
+                        not net.is_link_local and
+                        dest != "0.0.0.0"
+                    ):
+                        routed_networks[str(net)] = {
+                            "gateway": gateway,
+                            "interface": interface
+                        }
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"[get_windows_routed_networks] Error running netstat.exe -r: {e}")
+    return routed_networks
+
+def get_arp_table_networks():
+    """
+    Returns a set of networks found in the ARP table.
+    Works for both Windows and Linux.
+    """
+    import subprocess
+    import ipaddress
+    import platform
+    networks = set()
+    try:
+        if platform.system() == "Windows":
+            arp_output = subprocess.check_output(["arp", "-a"], text=True, errors="ignore")
+            for line in arp_output.splitlines():
+                parts = line.split()
+                if len(parts) >= 2:
+                    ip = parts[1]
+                    try:
+                        ipaddress.IPv4Address(ip)
+                        subnet = f"{ip.rsplit('.', 1)[0]}.0/24"
+                        networks.add(subnet)
+                    except Exception:
+                        pass
+        else:
+            arp_output = subprocess.check_output(["ip", "neigh"], text=True, errors="ignore")
+            for line in arp_output.splitlines():
+                parts = line.split()
+                if len(parts) >= 1:
+                    ip = parts[0]
+                    try:
+                        ipaddress.IPv4Address(ip)
+                        subnet = f"{ip.rsplit('.', 1)[0]}.0/24"
+                        networks.add(subnet)
+                    except Exception:
+                        pass
+    except Exception as e:
+        print(f"[get_arp_table_networks] ARP table scan failed: {e}")
+    print(f"[get_arp_table_networks] Networks found: {networks}")
+    return networks
+
+def get_common_networks():
+    """
+    Returns a set of common private IPv4 networks.
+    """
+    common = {
+        "192.168.0.0/24",
+        "192.168.1.0/24",
+        "10.0.0.0/24",
+        "10.1.1.0/24",
+        "172.16.0.0/24",
+        "172.16.1.0/24",
+    }
+    print(f"[get_common_networks] Common networks: {common}")
+    return common
+
+async def discover_bacnet_devices_on_subnet(proxy, subnet_address, device_instance_low=0, device_instance_high=4194303):
+    """
+    Uses BACnet Who-Is broadcast to search for devices on a specific subnet/network.
+    """
+    print(f"[discover_bacnet_devices_on_subnet] Broadcasting Who-Is to {subnet_address} for device instances {device_instance_low}-{device_instance_high}")
+    try:
+        devices = await proxy.who_is(device_instance_low, device_instance_high, f"{subnet_address}:47808")
+        print(f"[discover_bacnet_devices_on_subnet] Devices found: {devices}")
+        return devices
+    except Exception as e:
+        print(f"[discover_bacnet_devices_on_subnet] Error during BACnet broadcast: {e}")
+        return []
+
+async def discover_bacnet_devices_on_all_networks(proxy, networks, device_instance_low=0, device_instance_high=4194303):
+    """
+    Uses BACnet Who-Is broadcast to search for devices on all provided networks/subnets.
+    """
+    all_devices = []
+    for subnet in networks:
+        print(f"[discover_bacnet_devices_on_all_networks] Broadcasting Who-Is to {subnet}")
+        try:
+            devices = await proxy.who_is(device_instance_low, device_instance_high, f"{subnet.split('/')[0]}:47808")
+            print(f"[discover_bacnet_devices_on_all_networks] Devices found on {subnet}: {devices}")
+            all_devices.extend(devices)
+        except Exception as e:
+            print(f"[discover_bacnet_devices_on_all_networks] Error during BACnet broadcast to {subnet}: {e}")
+    return all_devices
+
+
+
+
+
     async def read_property(self, device_address: str, object_identifier: str, property_identifier: str,
                    property_array_index: int | None = None):
         try:
@@ -1472,6 +1796,7 @@ class ObjectUserLockTime(Tag):
 async def run_proxy(local_device_address, **kwargs):
     bp = BACnetProxy(local_device_address, **kwargs)
     await bp.start()
+
 
 
 def launch_bacnet(parser: ArgumentParser) -> tuple[ArgumentParser, Type[AsyncioProtocolProxy]]:
