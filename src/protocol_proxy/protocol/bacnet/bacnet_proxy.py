@@ -43,7 +43,7 @@ from bacpypes3.primitivedata import (
 )
 from bacpypes3.vendor import get_vendor_info
 
-# Local protocol proxy imports
+Local protocol proxy imports 
 from protocol_proxy.ipc import callback
 from protocol_proxy.proxy import launch
 from protocol_proxy.proxy.asyncio import AsyncioProtocolProxy
@@ -1211,7 +1211,7 @@ class BACnetProxy(AsyncioProtocolProxy):
             
             # Process raw results to organize by object identifier
             results = {}
-            objects_to_cache = {}
+            objects_to_cache = {};
             
             for key, value in raw_results.items():
                 if ':' in key:
@@ -1219,7 +1219,7 @@ class BACnetProxy(AsyncioProtocolProxy):
                     if obj_id not in results:
                         results[obj_id] = {}
                     if obj_id not in objects_to_cache:
-                        objects_to_cache[obj_id] = {}
+                        objects_to_cache[obj_id] = {};
                     
                     results[obj_id][property_name] = value
                     objects_to_cache[obj_id][property_name] = value
