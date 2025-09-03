@@ -693,13 +693,14 @@ class BACnetProxy(AsyncioProtocolProxy):
         max_duration: float = 280.0
     ) -> list:
         """
-        Smart subnet scan with global cache-informed scanning:
-          1. First scan ALL cached device addresses globally (comprehensive discovery)
-          2. Directed broadcast Who-Is (subnet broadcast)
-          3. Limited broadcast Who-Is (255.255.255.255)
-          4. Brute force unicast sweep of remaining addresses (if enabled and needed)
+        Smart subnet scan with global cache-informed scanning and router discovery:
+          1. Router discovery (Who-Is-Router-To-Network)
+          2. First scan ALL cached device addresses globally (comprehensive discovery)
+          3. Directed broadcast Who-Is (subnet broadcast)
+          4. Limited broadcast Who-Is (255.255.255.255)
+          5. Brute force unicast sweep of remaining addresses (if enabled and needed)
 
-        Note: Step 1 now scans ALL cached devices from ANY network to build comprehensive
+        Note: Step 2 now scans ALL cached devices from ANY network to build comprehensive
         network topology knowledge over time. Devices found on 130.20.24.0/24 will be
         checked when scanning 10.71.19.0/24, enabling cross-network discovery.
 
@@ -725,6 +726,7 @@ class BACnetProxy(AsyncioProtocolProxy):
         discovered: list[dict] = []
         seen_keys: set = set()
         scanned_ips: set = set()  # Track which IPs we've already scanned
+        router_info = []  # Track discovered routers
 
         def add_devices(devs: list[dict] | None):
             if not devs:
@@ -745,7 +747,60 @@ class BACnetProxy(AsyncioProtocolProxy):
                         except ValueError:
                             pass
 
-        # 1. Global cache-informed scanning - scan ALL known device IPs first (from any network)
+        # 1. Router discovery - Who-Is-Router-To-Network
+        _log.debug(f"[scan_subnet] Starting router discovery for network {network_str}")
+        try:
+            if hasattr(self.bacnet, 'app') and hasattr(self.bacnet.app, 'nse'):
+                router_response = await asyncio.wait_for(
+                    self.bacnet.app.nse.who_is_router_to_network(),
+                    timeout=whois_timeout
+                )
+                
+                if router_response:
+                    _log.info(f"[scan_subnet] Found {len(router_response)} router responses")
+                    for adapter, i_am_router_to_network in router_response:
+                        router_address = str(i_am_router_to_network.pduSource)
+                        networks = [str(net) for net in i_am_router_to_network.iartnNetworkList] if hasattr(i_am_router_to_network, 'iartnNetworkList') else []
+                        
+                        router_entry = {
+                            'router_address': router_address,
+                            'networks': networks,
+                            'adapter': str(adapter) if adapter else None
+                        }
+                        router_info.append(router_entry)
+                        
+                        _log.debug(f"[scan_subnet] Router at {router_address} serves networks: {networks}")
+                        
+                        # Try to extract IP from router address and scan it for devices
+                        try:
+                            if ':' in router_address:
+                                router_ip = router_address.split(':')[0]
+                            else:
+                                router_ip = router_address
+                            
+                            # Check if router IP is in our target network
+                            router_ip_obj = ipaddress.IPv4Address(router_ip)
+                            if router_ip_obj in net:
+                                # Scan the router itself for BACnet devices
+                                dest = f"{router_ip}:{port}"
+                                resp = await asyncio.wait_for(
+                                    self.who_is(low_id, high_id, dest), 
+                                    timeout=whois_timeout
+                                )
+                                if resp:
+                                    _log.debug(f"[scan_subnet] Found devices on router {dest}")
+                                    add_devices(resp)
+                        except (ValueError, asyncio.TimeoutError) as e:
+                            _log.debug(f"[scan_subnet] Could not scan router {router_address}: {e}")
+                else:
+                    _log.debug("[scan_subnet] No routers responded to Who-Is-Router-To-Network")
+                    
+        except (AttributeError, asyncio.TimeoutError) as e:
+            _log.debug(f"[scan_subnet] Router discovery failed or timed out: {e}")
+        except Exception as e:
+            _log.warning(f"[scan_subnet] Router discovery error: {e}")
+
+        # 2. Global cache-informed scanning - scan ALL known device IPs first (from any network)
         cached_devices = self.load_cached_devices(None)  # Get ALL cached devices globally
         if cached_devices:
             _log.info(f"[scan_subnet] Found {len(cached_devices)} global cached devices, scanning them first for comprehensive discovery")
@@ -788,7 +843,7 @@ class BACnetProxy(AsyncioProtocolProxy):
                 
                 _log.info(f"[scan_subnet] Global cached scan complete: {len(discovered)} devices verified from comprehensive discovery")
 
-        # 2. Directed broadcast
+        # 3. Directed broadcast
         directed_broadcast = f"{net.broadcast_address}:{port}"
         _log.debug(f"[scan_subnet] Directed broadcast Who-Is -> {directed_broadcast}")
         try:
@@ -799,7 +854,7 @@ class BACnetProxy(AsyncioProtocolProxy):
         except Exception as e:
             _log.debug(f"[scan_subnet] Directed broadcast error: {e}")
 
-        # 3. Limited broadcast if we haven't found many devices yet
+        # 4. Limited broadcast if we haven't found many devices yet
         if len(discovered) < 5:  # Arbitrary threshold - adjust as needed
             limited_broadcast = f"255.255.255.255:{port}"
             _log.debug(f"[scan_subnet] Limited broadcast Who-Is -> {limited_broadcast}")
@@ -811,7 +866,7 @@ class BACnetProxy(AsyncioProtocolProxy):
             except Exception as e:
                 _log.debug(f"[scan_subnet] Limited broadcast error: {e}")
 
-        # 4. Brute force unicast sweep of remaining addresses (skip already scanned IPs)
+        # 5. Brute force unicast sweep of remaining addresses (skip already scanned IPs)
         if enable_brute_force:
             remaining_hosts = [ip for ip in net.hosts() if ip not in scanned_ips]
             host_count = len(remaining_hosts)
@@ -848,12 +903,22 @@ class BACnetProxy(AsyncioProtocolProxy):
             else:
                 _log.debug("[scan_subnet] No remaining hosts to scan after cache verification")
 
-        # Save all discovered devices to cache
+        # Save all discovered devices to cache with router information
         for device in discovered:
+            # Add router information to device metadata if available
+            if router_info:
+                device['_router_info'] = router_info
             self.save_discovered_device(device, network_str, "scan")
 
         elapsed = time.time() - start_time
-        _log.info(f"[scan_subnet] Complete devices_found={len(discovered)} elapsed={elapsed:.2f}s")
+        _log.info(f"[scan_subnet] Complete devices_found={len(discovered)} routers_found={len(router_info)} elapsed={elapsed:.2f}s")
+        
+        # Log router summary
+        if router_info:
+            _log.info(f"[scan_subnet] Router summary:")
+            for router in router_info:
+                _log.info(f"  Router {router['router_address']} -> Networks: {router['networks']}")
+        
         return discovered
 
     async def read_device_all(self, device_address: str, device_object_identifier: str) -> dict:
