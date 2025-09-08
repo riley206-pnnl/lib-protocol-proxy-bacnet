@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# TODO move to discovery tool. 
+# TODO make it work with ubuntu also
 """
 Network Discovery Module for BACnet Scanning
 
@@ -118,47 +120,54 @@ def get_network_interfaces() -> Dict[str, Dict[str, str]]:
         print(f"[get_network_interfaces] Parsing network interfaces...")
         
         current_interface = None
+        current_ip = None
+        
         for line in output.splitlines():
             line = line.strip()
             
             # Detect interface names
             if "adapter" in line.lower() and ":" in line:
                 current_interface = line
+                current_ip = None  # Reset IP for new interface
                 continue
                 
-            # Look for IP addresses with subnet masks
+            # Look for IPv4 addresses
             if "IPv4 Address" in line or "IP Address" in line:
-                # Extract IP address
+                # Extract IP address - handle both formats
                 ip_match = re.search(r'(\d+\.\d+\.\d+\.\d+)', line)
                 if ip_match:
-                    ip_addr = ip_match.group(1)
+                    current_ip = ip_match.group(1)
+                    print(f"[get_network_interfaces] Found IP: {current_ip} on {current_interface}")
                     
-                    # Look for subnet mask in the next few lines
-                    continue
-                    
-            if "Subnet Mask" in line:
+            # Look for subnet mask - this should come after the IP address
+            if "Subnet Mask" in line and current_ip:
                 mask_match = re.search(r'(\d+\.\d+\.\d+\.\d+)', line)
-                if mask_match and ip_addr:
+                if mask_match:
                     subnet_mask = mask_match.group(1)
                     
                     try:
                         # Create network from IP and mask
-                        network = ipaddress.IPv4Network(f"{ip_addr}/{subnet_mask}", strict=False)
+                        network = ipaddress.IPv4Network(f"{current_ip}/{subnet_mask}", strict=False)
                         
                         if (not network.is_loopback and 
                             not network.is_link_local and
-                            network.prefixlen >= 8):
+                            network.prefixlen >= 8 and
+                            network.prefixlen <= 30):  # Reasonable network sizes
                             
                             interface_networks[str(network)] = {
                                 "interface": current_interface or "Unknown",
-                                "ip": ip_addr,
+                                "ip": current_ip,
+                                "subnet_mask": subnet_mask,
                                 "method": "interface_scan",
-                                "type": "interface"
+                                "type": "local_interface"
                             }
-                            print(f"[get_network_interfaces] Found interface network: {network} on {current_interface}")
+                            print(f"[get_network_interfaces] ✓ Found LOCAL network: {network} (IP: {current_ip}) on {current_interface}")
                             
                     except Exception as e:
-                        print(f"[get_network_interfaces] Error creating network from {ip_addr}/{subnet_mask}: {e}")
+                        print(f"[get_network_interfaces] Error creating network from {current_ip}/{subnet_mask}: {e}")
+                    
+                    # Reset for next interface
+                    current_ip = None
                         
     except Exception as e:
         print(f"[get_network_interfaces] Error running ipconfig: {e}")
@@ -476,14 +485,23 @@ async def discover_networks_for_bacnet(verbose: bool = False) -> Dict[str, List[
     
     for ip in successful_pings.keys():
         ip_addr = ipaddress.IPv4Address(ip)
+        
+        # Find all networks that contain this IP
+        candidate_networks = []
         for net_str in all_networks.keys():
             try:
                 network = ipaddress.IPv4Network(net_str, strict=False)
                 if ip_addr in network and network.prefixlen <= 24:
-                    responsive_networks.add(str(network))
-                    break
+                    candidate_networks.append(network)
             except:
                 pass
+                
+        # Choose the most specific network (highest prefix length)
+        if candidate_networks:
+            most_specific = max(candidate_networks, key=lambda n: n.prefixlen)
+            responsive_networks.add(str(most_specific))
+            if verbose:
+                print(f"[discover_networks_for_bacnet] IP {ip} found in {len(candidate_networks)} networks, chose most specific: {most_specific}")
     
     if verbose:
         print(f"\n=== DISCOVERY RESULTS ===")
