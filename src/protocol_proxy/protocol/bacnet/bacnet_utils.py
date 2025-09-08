@@ -1,5 +1,6 @@
 from bacpypes3.apdu import AbortPDU, ErrorPDU, ErrorRejectAbortNack, RejectPDU
 
+
 def make_jsonable(val):
     """Unified function to convert BACnet objects to JSON-serializable format."""
     # Handle basic JSON-serializable types
@@ -30,7 +31,7 @@ def make_jsonable(val):
     if hasattr(val, '__class__') and 'EngineeringUnits' in str(val.__class__):
         unit_str = str(val)
         if unit_str.startswith('EngineeringUnits(') and unit_str.endswith(')'):
-            return unit_str[17:-1]  # Remove "EngineeringUnits(" and ")"
+            return unit_str[17:-1]    # Remove "EngineeringUnits(" and ")"
         return unit_str
 
     # Handle Python enums
@@ -45,7 +46,7 @@ def make_jsonable(val):
 
     # Handle error objects
     if hasattr(val, '__class__') and 'Error' in val.__class__.__name__:
-        return None  # or str(val) if you want error details
+        return None    # or str(val) if you want error details
 
     # Handle objects with __dict__ (convert to dict)
     if hasattr(val, '__dict__') and not isinstance(val, type):
@@ -66,13 +67,18 @@ def make_jsonable(val):
     # Final fallback
     return str(val)
 
+
 def _handle_bacnet_response(result):
     """Helper method to handle BACnet responses and convert errors to JSON-serializable format."""
     if isinstance(result, AbortPDU):
         return {
-            "error": "AbortPDU",
-            "reason": str(result.apduAbortRejectReason) if hasattr(result, 'apduAbortRejectReason') else "Unknown abort reason",
-            "details": str(result)
+            "error":
+            "AbortPDU",
+            "reason":
+            str(result.apduAbortRejectReason)
+            if hasattr(result, 'apduAbortRejectReason') else "Unknown abort reason",
+            "details":
+            str(result)
         }
     elif isinstance(result, ErrorPDU):
         return {
@@ -83,14 +89,15 @@ def _handle_bacnet_response(result):
         }
     elif isinstance(result, RejectPDU):
         return {
-            "error": "RejectPDU",
-            "reason": str(result.apduAbortRejectReason) if hasattr(result, 'apduAbortRejectReason') else "Unknown reject reason",
-            "details": str(result)
+            "error":
+            "RejectPDU",
+            "reason":
+            str(result.apduAbortRejectReason)
+            if hasattr(result, 'apduAbortRejectReason') else "Unknown reject reason",
+            "details":
+            str(result)
         }
     elif isinstance(result, ErrorRejectAbortNack):
-        return {
-            "error": "ErrorRejectAbortNack",
-            "details": str(result)
-        }
+        return {"error": "ErrorRejectAbortNack", "details": str(result)}
     else:
         return result

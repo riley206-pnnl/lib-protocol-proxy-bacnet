@@ -8,9 +8,11 @@ import json
 
 # Global cache variables
 _object_list_cache = {}
-_cache_timeout = 300  # 5 minutes
+_cache_timeout = 300    # 5 minutes
 
-async def _get_cached_object_list(bacnet_instance, object_list_cache, cache_timeout, device_address: str, device_object_identifier: str):
+
+async def _get_cached_object_list(bacnet_instance, object_list_cache, cache_timeout,
+                                  device_address: str, device_object_identifier: str):
     """
     Get object-list from cache if available and not expired, otherwise read from device.
     Returns the object-list or None if there was an error.
@@ -27,15 +29,22 @@ async def _get_cached_object_list(bacnet_instance, object_list_cache, cache_time
 
     # Cache miss or expired - read from device
     try:
-        _log.info(f"Reading object-list from device {device_address} with device_object_identifier='{device_object_identifier}'")
-        object_list = await bacnet_instance.read_property(device_address, device_object_identifier, "object-list")
+        _log.info(
+            f"Reading object-list from device {device_address} with device_object_identifier='{device_object_identifier}'"
+        )
+        object_list = await bacnet_instance.read_property(device_address, device_object_identifier,
+                                                          "object-list")
 
         # Add detailed logging of what we got back
-        _log.info(f"Raw object-list response from {device_address}: type={type(object_list)}, value={object_list}")
+        _log.info(
+            f"Raw object-list response from {device_address}: type={type(object_list)}, value={object_list}"
+        )
 
         # Check for BACnet error responses
         if isinstance(object_list, (AbortPDU, ErrorPDU, RejectPDU, ErrorRejectAbortNack)):
-            _log.error(f"BACnet error reading object-list from {device_address}: {type(object_list).__name__} - {object_list}")
+            _log.error(
+                f"BACnet error reading object-list from {device_address}: {type(object_list).__name__} - {object_list}"
+            )
 
             # If it's an ErrorPDU, log more details
             if isinstance(object_list, ErrorPDU):
@@ -46,12 +55,16 @@ async def _get_cached_object_list(bacnet_instance, object_list_cache, cache_time
             return None
 
         # Ensure it's actually a list/iterable
-        if object_list and hasattr(object_list, '__iter__') and not isinstance(object_list, (str, bytes)):
+        if object_list and hasattr(object_list,
+                                   '__iter__') and not isinstance(object_list, (str, bytes)):
             object_list_cache[cache_key] = (object_list, current_time)
-            _log.info(f"Successfully cached object-list for {cache_key} with {len(object_list)} objects")
+            _log.info(
+                f"Successfully cached object-list for {cache_key} with {len(object_list)} objects")
             return object_list
         else:
-            _log.error(f"Invalid object-list response from {device_address}: type={type(object_list)}, value={object_list}")
+            _log.error(
+                f"Invalid object-list response from {device_address}: type={type(object_list)}, value={object_list}"
+            )
             return None
 
     except Exception as e:
@@ -59,7 +72,10 @@ async def _get_cached_object_list(bacnet_instance, object_list_cache, cache_time
         _log.error(f"Exception traceback: {traceback.format_exc()}")
         return None
 
-def _clear_cache_for_device(object_list_cache, device_address: str, device_object_identifier: str = None):
+
+def _clear_cache_for_device(object_list_cache,
+                            device_address: str,
+                            device_object_identifier: str = None):
     """Clear cache for a specific device or all devices."""
     if device_object_identifier:
         cache_key = f"{device_address}:{device_object_identifier}"
@@ -68,18 +84,18 @@ def _clear_cache_for_device(object_list_cache, device_address: str, device_objec
             _log.debug(f"Cleared cache for {cache_key}")
     else:
         # Clear all entries for this device address
-        keys_to_remove = [key for key in object_list_cache.keys() if key.startswith(f"{device_address}:")]
+        keys_to_remove = [
+            key for key in object_list_cache.keys() if key.startswith(f"{device_address}:")
+        ]
         for key in keys_to_remove:
             del object_list_cache[key]
         _log.debug(f"Cleared cache for all objects at {device_address}")
 
+
 def _get_cache_stats(object_list_cache, cache_timeout):
     """Get cache statistics for debugging."""
     current_time = time.time()
-    stats = {
-        "total_entries": len(object_list_cache),
-        "entries": []
-    }
+    stats = {"total_entries": len(object_list_cache), "entries": []}
 
     for cache_key, (object_list, timestamp) in object_list_cache.items():
         age = current_time - timestamp
@@ -92,7 +108,9 @@ def _get_cache_stats(object_list_cache, cache_timeout):
 
     return stats
 
-def save_object_properties(device_address: str, device_object_identifier: str, object_id: str, properties: dict):
+
+def save_object_properties(device_address: str, device_object_identifier: str, object_id: str,
+                           properties: dict):
     """Save object properties to CSV cache."""
     try:
         from pathlib import Path
@@ -105,9 +123,9 @@ def save_object_properties(device_address: str, device_object_identifier: str, o
             with open(object_cache_file, 'w', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow([
-                    'device_address', 'device_object_identifier', 'object_id',
-                    'object_name', 'units', 'present_value', 'object_type',
-                    'first_discovered', 'last_updated', 'read_count'
+                    'device_address', 'device_object_identifier', 'object_id', 'object_name',
+                    'units', 'present_value', 'object_type', 'first_discovered', 'last_updated',
+                    'read_count'
                 ])
 
         # Read existing data
@@ -124,7 +142,7 @@ def save_object_properties(device_address: str, device_object_identifier: str, o
                 return ""
             # Check if it's an ErrorType object
             if hasattr(value, '__class__') and 'ErrorType' in str(value.__class__):
-                return ""  # Skip error values
+                return ""    # Skip error values
             return str(value)
 
         # Update or create record
@@ -160,9 +178,8 @@ def save_object_properties(device_address: str, device_object_identifier: str, o
         # Write back CSV
         with open(object_cache_file, 'w', newline='') as f:
             fieldnames = [
-                'device_address', 'device_object_identifier', 'object_id',
-                'object_name', 'units', 'present_value', 'object_type',
-                'first_discovered', 'last_updated', 'read_count'
+                'device_address', 'device_object_identifier', 'object_id', 'object_name', 'units',
+                'present_value', 'object_type', 'first_discovered', 'last_updated', 'read_count'
             ]
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
@@ -173,12 +190,17 @@ def save_object_properties(device_address: str, device_object_identifier: str, o
         with open(object_json_file, 'w') as f:
             json.dump(list(existing.values()), f, indent=2)
 
-        _log.debug(f"Saved object {object_id} properties for device {device_address} to CSV and JSON")
+        _log.debug(
+            f"Saved object {object_id} properties for device {device_address} to CSV and JSON")
 
     except Exception as e:
         _log.error(f"Error saving object properties: {e}")
 
-def load_cached_object_properties(device_address: str, device_object_identifier: str, page: int = 1, page_size: int = 100) -> dict:
+
+def load_cached_object_properties(device_address: str,
+                                  device_object_identifier: str,
+                                  page: int = 1,
+                                  page_size: int = 100) -> dict:
     """Load cached object properties from CSV file with pagination."""
     try:
         from pathlib import Path
@@ -194,8 +216,8 @@ def load_cached_object_properties(device_address: str, device_object_identifier:
         with open(object_cache_file, 'r', newline='') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                if (row['device_address'] == device_address and
-                    row['device_object_identifier'] == device_object_identifier):
+                if (row['device_address'] == device_address
+                        and row['device_object_identifier'] == device_object_identifier):
                     device_objects.append(row)
 
         if not device_objects:
@@ -208,8 +230,10 @@ def load_cached_object_properties(device_address: str, device_object_identifier:
 
         # Check if the requested page exists in our cache
         if page > total_cached_pages:
-            _log.debug(f"Requested page {page} is beyond cached data (cached pages: {total_cached_pages}), falling back to fresh read")
-            return None  # Fall back to fresh read
+            _log.debug(
+                f"Requested page {page} is beyond cached data (cached pages: {total_cached_pages}), falling back to fresh read"
+            )
+            return None    # Fall back to fresh read
 
         # We have this page in cache, return it
         start_idx = (page - 1) * page_size
