@@ -59,7 +59,6 @@ from bacpypes3.vendor import get_vendor_info
 from protocol_proxy.ipc import callback
 from protocol_proxy.proxy import launch
 from protocol_proxy.proxy.asyncio import AsyncioProtocolProxy
-from protocol_proxy.protocol.bacnet.network_discover_ping import discover_networks_for_bacnet
 from protocol_proxy.protocol.bacnet.logging_utils import _log
 
 logging.basicConfig(filename='/tmp/bacnet_proxy.log', level=logging.DEBUG,
